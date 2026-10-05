@@ -66,6 +66,10 @@ ZOOM_DISPLACEMENT_THRESHOLD = 0.15
 ZOOM_COOLDOWN_SECONDS = 1.0
 ZOOM_SCROLL_AMOUNT = 300
 
+ZOOM_SMOOTH_DEADZONE = 0.0015       # per-frame hand-distance change smaller than this is ignored as noise
+ZOOM_SMOOTH_SENSITIVITY = 6000      # scales hand-distance change into a scroll amount
+ZOOM_SMOOTH_MAX_STEP = 150          # cap on scroll amount sent in a single frame
+
 ACTIVITY_LOG_MAX_ENTRIES = 50
 
 IDLE_LOCK_TIMEOUT_SECONDS = 30    # lock the app after this long with no hand seen
@@ -77,6 +81,7 @@ ACTIVITY_LOG_MAX_FILE_BYTES = 200_000
 
 SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
 pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0    # default 0.1s pause after every pyautogui call was stalling cursor movement each frame
 
 DEFAULT_MAPPING = {
     "fist": "double_click",
@@ -106,14 +111,18 @@ def press_scroll_down():
 def press_zoom_in():
     pyautogui.keyDown("ctrl")
     try:
+        time.sleep(0.05)   # let the Ctrl keydown register before scrolling (some apps, e.g. Edge PDF viewer, miss it otherwise)
         pyautogui.scroll(ZOOM_SCROLL_AMOUNT)
+        time.sleep(0.05)
     finally:
         pyautogui.keyUp("ctrl")
 
 def press_zoom_out():
     pyautogui.keyDown("ctrl")
     try:
+        time.sleep(0.05)
         pyautogui.scroll(-ZOOM_SCROLL_AMOUNT)
+        time.sleep(0.05)
     finally:
         pyautogui.keyUp("ctrl")
 
@@ -166,6 +175,10 @@ def get_palm_center(hand_landmarks):
     avg_y = sum(p.y for p in points) / len(points)
     return avg_x, avg_y
 
+def get_cursor_point(hand_landmarks):
+    lm = hand_landmarks.landmark[9]    # MIDDLE_FINGER_MCP - stabler single-point reference than wrist (0)
+    return lm.x, lm.y
+
 def get_two_hand_distance(hand_a, hand_b):
     ax, ay = get_palm_center(hand_a)
     bx, by = get_palm_center(hand_b)
@@ -208,7 +221,7 @@ def save_mapping(mapping):
     with open(MAPPING_PATH, "w") as f:
         json.dump(mapping, f, indent=2)
 
-def augment_landmarks(X, y, copies=2, noise_std=0.01, scale_range=0.05, seed=42):
+def augment_landmarks(X, y, copies=2, noise_std=0.01, scale_range=0.05, seed=42, mirror=True):
     rng = np.random.default_rng(seed)
     all_X = [X]
     all_y = [y]
@@ -216,6 +229,14 @@ def augment_landmarks(X, y, copies=2, noise_std=0.01, scale_range=0.05, seed=42)
         noise = rng.normal(0, noise_std, X.shape)
         scale = rng.uniform(1 - scale_range, 1 + scale_range, size=(X.shape[0], 1))
         all_X.append(X * scale + noise)
+        all_y.append(y)
+    if mirror:
+        # Negate every x-coordinate (columns 0, 3, 6, ... of the x,y,z-per-landmark layout)
+        # to simulate the opposite hand, so a gesture recorded with only one hand still
+        # trains the model to recognize it on either hand.
+        X_mirrored = X.copy()
+        X_mirrored[:, 0::3] *= -1
+        all_X.append(X_mirrored)
         all_y.append(y)
     return np.vstack(all_X), np.concatenate(all_y)
 
@@ -478,6 +499,7 @@ class KinesisApp(QMainWindow):
         self.zoom_enabled = False
         self.two_hand_distance_history = deque(maxlen=ZOOM_DISTANCE_HISTORY_LEN)
         self.last_zoom_time = 0
+        self.zoom_ctrl_held = False
 
         self.app_mode = "normal"
         self.new_gesture_name = ""
@@ -712,6 +734,17 @@ class KinesisApp(QMainWindow):
         self.record_btn.clicked.connect(self.start_recording)
         button_row.addWidget(self.record_btn)
 
+        self.recording_tips_btn = QPushButton("ⓘ")
+        self.recording_tips_btn.setFixedWidth(28)
+        self.recording_tips_btn.setToolTip("Tips for recording a gesture")
+        self.recording_tips_btn.clicked.connect(self.show_recording_tips)
+        button_row.addWidget(self.recording_tips_btn)
+
+        self.save_btn = QPushButton("Save Gesture")
+        self.save_btn.clicked.connect(self.save_recording)
+        self.save_btn.setVisible(False)
+        button_row.addWidget(self.save_btn)
+
         self.train_btn = QPushButton("Retrain Model")
         self.train_btn.clicked.connect(self.retrain_model)
         button_row.addWidget(self.train_btn)
@@ -729,9 +762,16 @@ class KinesisApp(QMainWindow):
         self.self_test_btn.clicked.connect(self.run_self_test)
         right_layout.addWidget(self.self_test_btn)
 
+        status_row = QHBoxLayout()
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        right_layout.addWidget(self.status_label)
+        status_row.addWidget(self.status_label)
+
+        self.retake_btn = QPushButton("Retake")
+        self.retake_btn.clicked.connect(self.retake_recording)
+        self.retake_btn.setVisible(False)
+        status_row.addWidget(self.retake_btn)
+        right_layout.addLayout(status_row)
 
         danger_title = QLabel("Danger Zone")
         danger_title.setObjectName("sectionTitle")
@@ -851,6 +891,7 @@ class KinesisApp(QMainWindow):
     def on_zoom_toggled(self, state):
         self.zoom_enabled = (state == Qt.Checked)
         self.two_hand_distance_history.clear()
+        self._release_zoom_ctrl()
 
     def _refresh_unlock_gesture_options(self):
         self.unlock_gesture_combo.blockSignals(True)
@@ -881,6 +922,7 @@ class KinesisApp(QMainWindow):
         for buffer in self.recent_predictions_by_hand.values():
             buffer.clear()
         self.two_hand_distance_history.clear()
+        self._release_zoom_ctrl()
 
     def toggle_pause(self):
         self.paused = not self.paused
@@ -983,6 +1025,23 @@ class KinesisApp(QMainWindow):
         except Exception as e:
             QMessageBox.information(self, "Screenshots folder", f"Screenshots are saved in:\n{folder}")
 
+    def show_recording_tips(self):
+        QMessageBox.information(
+            self, "Recording tips",
+            "For a gesture the model can recognize reliably:\n\n"
+            "- Move your hand slightly closer to and farther from the camera "
+            "while holding the gesture, instead of staying frozen in one spot.\n"
+            "- Shift your hand a little left/right/up/down within the frame too.\n"
+            "- Tilt or rotate your wrist slightly between frames.\n"
+            "- Keep the gesture shape itself consistent (same fingers, same "
+            "general pose) - only the position/angle should vary.\n"
+            "- Make sure your hand is well lit and clearly visible for all "
+            "150 frames.\n\n"
+            "This natural in/out and side-to-side movement gives the model "
+            "variety to learn from, so it still recognizes the gesture when "
+            "your hand isn't in the exact same spot later."
+        )
+
     def start_recording(self):
         name = self.name_input.text().strip()
         if not name:
@@ -993,6 +1052,7 @@ class KinesisApp(QMainWindow):
         self.recording_buffer = []
         self.app_mode = "recording"
         self.record_btn.setEnabled(False)
+        self.retake_btn.setVisible(True)
         self.status_label.setText(f"Recording '{name}'... hold your gesture steady.")
 
     def record_more_samples(self, gesture_name):
@@ -1000,6 +1060,7 @@ class KinesisApp(QMainWindow):
         self.recording_buffer = []
         self.app_mode = "recording"
         self.record_btn.setEnabled(False)
+        self.retake_btn.setVisible(True)
         self.status_label.setText(f"Recording more samples for '{gesture_name}'... hold your gesture steady.")
 
     def balance_dataset(self):
@@ -1185,6 +1246,14 @@ class KinesisApp(QMainWindow):
             self._log_activity(f"Deleted '{gesture_name}' but retraining FAILED: {e}")
 
     def finish_recording(self):
+        self.app_mode = "reviewing"
+        self.save_btn.setVisible(True)
+        self.status_label.setText(
+            f"Captured {len(self.recording_buffer)} frames for '{self.new_gesture_name}'. "
+            f"Click Save Gesture to keep it, or Retake to redo."
+        )
+
+    def save_recording(self):
         if not os.path.exists(CSV_PATH):
             header = ["label"] + [f"{axis}{i}" for i in range(21) for axis in ("x", "y", "z")]
             pd.DataFrame(columns=header).to_csv(CSV_PATH, index=False)
@@ -1194,14 +1263,25 @@ class KinesisApp(QMainWindow):
         new_df = pd.DataFrame(rows, columns=header)
         new_df.to_csv(CSV_PATH, mode="a", header=False, index=False)
 
+        saved_count = len(self.recording_buffer)
+        self.recording_buffer = []
         self.app_mode = "normal"
         self.record_btn.setEnabled(True)
+        self.save_btn.setVisible(False)
+        self.retake_btn.setVisible(False)
         self._refresh_dataset_info()
         self.status_label.setText(
-            f"Saved {len(self.recording_buffer)} frames for '{self.new_gesture_name}'. "
+            f"Saved {saved_count} frames for '{self.new_gesture_name}'. "
             f"Record a few more takes for variety, or click Retrain Model when ready."
         )
-        self._log_activity(f"Recorded {len(self.recording_buffer)} frames for '{self.new_gesture_name}'")
+        self._log_activity(f"Recorded {saved_count} frames for '{self.new_gesture_name}'")
+
+    def retake_recording(self):
+        self.recording_buffer = []
+        self.app_mode = "recording"
+        self.record_btn.setEnabled(False)
+        self.save_btn.setVisible(False)
+        self.status_label.setText(f"Retaking '{self.new_gesture_name}'... hold your gesture steady.")
 
     def retrain_model(self):
         if not os.path.exists(CSV_PATH):
@@ -1299,7 +1379,7 @@ class KinesisApp(QMainWindow):
         return x_min, x_max, y_min, y_max
 
     def move_cursor_from_landmark(self, hand_landmarks):
-        palm_x, palm_y = get_palm_center(hand_landmarks)
+        palm_x, palm_y = get_cursor_point(hand_landmarks)
         x_min, x_max, y_min, y_max = self.compute_active_zone()
         mapped_x = remap_range(palm_x, x_min, x_max, 0, 1)
         mapped_y = remap_range(palm_y, y_min, y_max, 0, 1)
@@ -1438,8 +1518,10 @@ class KinesisApp(QMainWindow):
                         self._check_zoom(hands_this_frame[0][1], hands_this_frame[1][1])
                     else:
                         self.two_hand_distance_history.clear()
+                        self._release_zoom_ctrl()
                 else:
                     self.two_hand_distance_history.clear()
+                    self._release_zoom_ctrl()
 
         elif self.app_mode == "normal":
             self.gesture_label.setText("Gesture: none")
@@ -1447,6 +1529,7 @@ class KinesisApp(QMainWindow):
             for buffer in self.recent_predictions_by_hand.values():
                 buffer.append(None)
             self.two_hand_distance_history.clear()
+            self._release_zoom_ctrl()
 
         elif self.app_mode == "locked":
             self.gesture_label.setText("Locked")
@@ -1475,39 +1558,46 @@ class KinesisApp(QMainWindow):
         distance = get_two_hand_distance(hand_a, hand_b)
         self.two_hand_distance_history.append(distance)
 
-        if len(self.two_hand_distance_history) < self.two_hand_distance_history.maxlen:
+        if len(self.two_hand_distance_history) < 2:
             return
 
-        displacement = self.two_hand_distance_history[-1] - self.two_hand_distance_history[0]
-        now = time.time()
+        # Frame-to-frame change (not the old 8-frame window), so zoom responds
+        # to ongoing hand movement every frame instead of waiting for one big
+        # displacement and then cooling down for a full second.
+        delta = self.two_hand_distance_history[-1] - self.two_hand_distance_history[-2]
 
-        if now - self.last_zoom_time < ZOOM_COOLDOWN_SECONDS:
+        if abs(delta) < ZOOM_SMOOTH_DEADZONE:
             return
 
-        if displacement >= ZOOM_DISPLACEMENT_THRESHOLD:
-            try:
-                press_zoom_in()
+        scroll_amount = int(min(abs(delta) * ZOOM_SMOOTH_SENSITIVITY, ZOOM_SMOOTH_MAX_STEP))
+        if scroll_amount < 1:
+            return
+
+        try:
+            if not self.zoom_ctrl_held:
+                pyautogui.keyDown("ctrl")
+                self.zoom_ctrl_held = True
+            pyautogui.scroll(scroll_amount if delta > 0 else -scroll_amount)
+            if delta > 0:
                 self.last_action_label.setText("Last action: Hands apart -> Zoom in")
-                self._log_activity("Hands apart -> Zoom in")
-            except Exception as e:
-                print(f"Zoom in failed: {e}")
-                self._log_activity(f"Zoom in FAILED: {e}")
-            self.last_zoom_time = now
-            self.two_hand_distance_history.clear()
-
-        elif displacement <= -ZOOM_DISPLACEMENT_THRESHOLD:
-            try:
-                press_zoom_out()
+            else:
                 self.last_action_label.setText("Last action: Hands together -> Zoom out")
-                self._log_activity("Hands together -> Zoom out")
-            except Exception as e:
-                print(f"Zoom out failed: {e}")
-                self._log_activity(f"Zoom out FAILED: {e}")
-            self.last_zoom_time = now
-            self.two_hand_distance_history.clear()
+            self.last_zoom_time = time.time()
+        except Exception as e:
+            print(f"Zoom failed: {e}")
+            self._log_activity(f"Zoom FAILED: {e}")
+
+    def _release_zoom_ctrl(self):
+        if self.zoom_ctrl_held:
+            try:
+                pyautogui.keyUp("ctrl")
+            except Exception:
+                pass
+            self.zoom_ctrl_held = False
 
     def closeEvent(self, event):
         self.timer.stop()
+        self._release_zoom_ctrl()
         self._show_video_overlay_message("Quitting...")
         self.cap.release()
         event.accept()
