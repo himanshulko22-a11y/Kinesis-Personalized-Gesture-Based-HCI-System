@@ -1,14 +1,3 @@
-"""
-Kinesis - Personalized Gesture-Based HCI System
-
-Control your computer with hand gestures using your webcam.
-Record your own gestures, train a small neural network, and map
-each gesture to an action (click, scroll, volume, screenshot, etc.).
-
-Author: Himanshu Chauhan
-License: MIT
-Run: python kinesis_app.py  (install packages with requirements.txt)
-"""
 import sys
 import os
 import shutil
@@ -928,9 +917,12 @@ class KinesisApp(QMainWindow):
         self.paused = not self.paused
         self.pause_btn.setText("Resume Recognition" if self.paused else "Pause Recognition")
         self._clear_prediction_state()
+        self.last_activity_time = time.time()  # restart idle-lock timer on pause/resume
         if self.paused:
             self.gesture_label.setText("Gesture: (paused)")
             self.confidence_label.setText("Confidence: -")
+        else:
+            self.status_label.setText("")
         self._log_activity("Recognition paused" if self.paused else "Recognition resumed")
 
     def _enter_locked_mode(self, reason="idle timeout"):
@@ -1050,6 +1042,7 @@ class KinesisApp(QMainWindow):
 
         self.new_gesture_name = name
         self.recording_buffer = []
+        self._release_zoom_ctrl()
         self.app_mode = "recording"
         self.record_btn.setEnabled(False)
         self.retake_btn.setVisible(True)
@@ -1433,6 +1426,8 @@ class KinesisApp(QMainWindow):
         success, frame = self.cap.read()
         if not success:
             self.consecutive_failed_reads += 1
+            if self.consecutive_failed_reads == 30:
+                self.status_label.setText("Camera not returning frames - check it's connected and not used by another app.")
             return
         self.consecutive_failed_reads = 0
 
@@ -1457,9 +1452,17 @@ class KinesisApp(QMainWindow):
 
         primary_label, primary_hand = (hands_this_frame[0] if hands_this_frame else (None, None))
 
+        now_ts = time.time()
+        stalled = (now_ts - getattr(self, "_last_frame_time", now_ts)) > 2.0   # e.g. UI blocked by retraining
+        self._last_frame_time = now_ts
+        if stalled or self.paused or self.app_mode in ("recording", "reviewing"):
+            self.last_activity_time = now_ts
+
         if self.app_mode == "normal" and not self.paused and self.model is not None:
             if hands_this_frame:
                 self.last_activity_time = time.time()
+                if self.status_label.text().startswith("No hand detected"):
+                    self.status_label.setText("")
             else:
                 idle_elapsed = time.time() - self.last_activity_time
                 remaining = IDLE_LOCK_TIMEOUT_SECONDS - idle_elapsed
@@ -1479,7 +1482,7 @@ class KinesisApp(QMainWindow):
             if len(self.recording_buffer) >= FRAMES_PER_RECORDING:
                 self.finish_recording()
 
-        elif self.paused:
+        elif self.paused and self.app_mode == "normal":
             self.gesture_label.setText("Gesture: (paused)")
             self.confidence_label.setText("Confidence: -")
 
@@ -1600,6 +1603,7 @@ class KinesisApp(QMainWindow):
         self._release_zoom_ctrl()
         self._show_video_overlay_message("Quitting...")
         self.cap.release()
+        self.hands.close()
         event.accept()
 
 def main():
