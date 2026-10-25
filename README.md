@@ -2,6 +2,12 @@
 
 Control your computer with hand gestures through your webcam. Kinesis lets you **record your own gestures, train a small neural network on them, and map each gesture to an action** such as clicking, scrolling, changing the volume, or taking a screenshot.
 
+## Screenshots
+
+<img width="960" height="507" alt="123" src="https://github.com/user-attachments/assets/f7f543c7-1d98-4944-a111-887d6b0e4377" />
+
+<img width="960" height="506" alt="321" src="https://github.com/user-attachments/assets/14579d4a-c012-4320-ac4b-a974fe147fe9" />
+
 ## Features
 
 - **Custom gestures:** record any gesture you like and train the model in a few clicks. No pre-built gesture set is forced on you.
