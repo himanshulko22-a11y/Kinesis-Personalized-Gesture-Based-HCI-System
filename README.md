@@ -2,17 +2,23 @@
 
 Control your computer with hand gestures through your webcam. Kinesis lets you **record your own gestures, train a small neural network on them, and map each gesture to an action** such as clicking, scrolling, changing the volume, or taking a screenshot.
 
+## Screenshots
+
+<img width="960" height="507" alt="123" src="https://github.com/user-attachments/assets/f7f543c7-1d98-4944-a111-887d6b0e4377" />
+
+<img width="960" height="506" alt="321" src="https://github.com/user-attachments/assets/14579d4a-c012-4320-ac4b-a974fe147fe9" />
+
 ## Features
 
 - **Custom gestures:** record any gesture you like and train the model in a few clicks. No pre-built gesture set is forced on you.
 - **Gesture-to-action mapping:** choose what each gesture does from the app's mapping list.
-- **Cursor control:** point with your hand to move the mouse, with an adjustable sensitivity slider.
+- **Cursor control:** point with your hand to move the mouse, with an adjustable sensitivity slider. The cursor follows the base of the middle finger (landmark 9), which shakes less than the wrist or a fingertip.
 - **Two-hand zoom:** move both hands apart or together to zoom in and out (can be turned on or off).
 - **Idle lock and unlock:** the app locks itself when no hand is seen for a while, and you unlock it by holding a chosen gesture (or with a button).
 - **Confidence threshold:** set how sure the model must be before an action fires.
 - **Built-in model tools:** dataset info, dataset balancing, optional data augmentation, a self-test for accuracy, and a confusion matrix.
 - **Activity log:** see what the app did and when.
-- **Safety options:** pause recognition at any time, reset all data, or restore default backup files.
+- **Safety options:** pause recognition at any time, reset all data, and save or restore a default setup. Gestures never fire while a dialog is open.
 
 ## Available actions
 
@@ -23,13 +29,13 @@ Left click, right click, double click, move cursor, volume up/down, scroll up/do
 1. Your webcam feed goes through [MediaPipe Hands](https://developers.google.com/mediapipe), which finds 21 landmarks on each hand.
 2. The landmarks are normalized relative to your wrist, so the position of your hand in the frame doesn't matter.
 3. A small neural network built with TensorFlow/Keras (dense layers) classifies the gesture.
-4. A gesture must be stable across several frames, and stay above the confidence threshold, before its action runs. There is also a cooldown so actions don't repeat by accident.
+4. A gesture must be stable across several frames, and stay above the confidence threshold, before its action runs. Clicks, screenshots and window switching fire **once** per gesture: holding the gesture doesn't repeat them. Volume and scroll keep repeating while held.
 5. Actions are performed with PyAutoGUI. The interface is built with PyQt5.
 
 ## Requirements
 
 - **Windows** (the app uses the DirectShow camera backend and Windows-specific features)
-- Python 3.9 to 3.11 recommended
+- Python 3.11 (TensorFlow 2.15 supports up to 3.11 and pandas 3 needs 3.11 or newer)
 - A webcam
 
 ## Installation
@@ -62,9 +68,20 @@ No trained model is included, so you start by teaching the app your gestures:
 - Keep the number of samples roughly equal across gestures. **Balance Dataset** can help.
 - Raise the confidence threshold if you get accidental actions, and lower it if gestures aren't detected.
 
+## Project files
+
+| File | Contents |
+|------|----------|
+| `Kinesis_app.py` | Main window and the per-frame loop (run this) |
+| `gestures.py` | Landmarks, smoothing, dataset, model training, gesture-to-action mapping |
+| `actions.py` | What each action does (click, volume, scroll...) |
+| `widgets.py` | Small UI pieces: buttons, mapping row, confusion matrix |
+| `config.py` | All settings and file paths |
+| `style.py` | Window theme |
+
 ## Files the app creates
 
-These are made while you use the app and are not part of the repository:
+These are made next to `Kinesis_app.py` while you use the app and are not part of the repository:
 
 | File | Purpose |
 |------|---------|
@@ -73,7 +90,8 @@ These are made while you use the app and are not part of the repository:
 | `label_encoder.pkl` | Gesture name encoder |
 | `gesture_mapping.json` | Your gesture-to-action settings |
 | `activity_log.txt` | Activity log |
-| `screenshot_*.png` | Screenshots taken by the screenshot gesture |
+| `screenshots/` | Screenshots taken by the screenshot gesture |
+| `*_backup.*` | Your saved default setup (**Save as Default**) |
 
 ## Built with
 

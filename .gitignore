@@ -1,0 +1,14 @@
+# Your personal data - stays on your PC, never uploaded
+gesture_data*.csv
+gesture_model*.keras
+label_encoder*.pkl
+gesture_mapping*.json
+activity_log.txt*
+screenshots/
+screenshot_*.png
+
+# Python / editor files
+__pycache__/
+*.pyc
+.vscode/
+.venv/
