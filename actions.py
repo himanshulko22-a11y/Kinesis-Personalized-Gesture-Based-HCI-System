@@ -31,7 +31,8 @@ def _screenshot():
 # ---------- Mistake hotkey (Windows virtual-key codes, checked from any app) ----------
 
 MODIFIER_KEYS = {"Ctrl": 0x11, "Alt": 0x12, "Shift": 0x10, "Meta": 0x5B}
-NAMED_KEYS = {"Space": 0x20, "Esc": 0x1B, "Ins": 0x2D, "Del": 0x2E, "Home": 0x24, "End": 0x23,
+NAMED_KEYS = {"Space": 0x20, "Esc": 0x1B, "Backspace": 0x08, "Tab": 0x09, "Return": 0x0D, "Enter": 0x0D,
+              "Print": 0x2C, "Ins": 0x2D, "Del": 0x2E, "Home": 0x24, "End": 0x23,
               "PgUp": 0x21, "PgDown": 0x22, "Left": 0x25, "Up": 0x26, "Right": 0x27, "Down": 0x28,
               "Pause": 0x13, "ScrollLock": 0x91}
 
@@ -54,7 +55,8 @@ def parse_hotkey(text):
     elif key in NAMED_KEYS:
         codes.append(NAMED_KEYS[key])
     else:
-        raise ValueError(f"'{key}' isn't supported - use a letter, digit, F1-F24 or a key like Space/Home.")
+        raise ValueError(f"'{key}' isn't supported - use a letter, digit, F1-F24, or a key like "
+                         f"Space, Backspace, Tab, Enter, Home or Del.")
     return codes
 
 
@@ -95,4 +97,62 @@ ACTIONS = {
     "scroll_up":          Action("Scroll Up", "repeat", lambda: pyautogui.scroll(cfg.SCROLL_AMOUNT)),
     "scroll_down":        Action("Scroll Down", "repeat", lambda: pyautogui.scroll(-cfg.SCROLL_AMOUNT)),
     "mark_mistake":       Action("Mark Last Action as Mistake", "once", None),   # handled by the app
+    # Ready-made keyboard shortcuts
+    "play_pause":         Action("Media: Play / Pause", "once", lambda: pyautogui.press("playpause")),
+    "next_track":         Action("Media: Next Track", "once", lambda: pyautogui.press("nexttrack")),
+    "prev_track":         Action("Media: Previous Track", "once", lambda: pyautogui.press("prevtrack")),
+    "mute":               Action("Mute / Unmute", "once", lambda: pyautogui.press("volumemute")),
+    "next_slide":         Action("Next Slide (Right arrow)", "once", lambda: pyautogui.press("right")),
+    "prev_slide":         Action("Previous Slide (Left arrow)", "once", lambda: pyautogui.press("left")),
+    "show_desktop":       Action("Show Desktop (Win+D)", "once", lambda: pyautogui.hotkey("win", "d")),
+    "task_view":          Action("Task View (Win+Tab)", "once", lambda: pyautogui.hotkey("win", "tab")),
+    "copy":               Action("Copy (Ctrl+C)", "once", lambda: pyautogui.hotkey("ctrl", "c")),
+    "paste":              Action("Paste (Ctrl+V)", "once", lambda: pyautogui.hotkey("ctrl", "v")),
+    "undo":               Action("Undo (Ctrl+Z)", "once", lambda: pyautogui.hotkey("ctrl", "z")),
+    "enter":              Action("Enter", "once", lambda: pyautogui.press("enter")),
+    "escape":             Action("Escape", "once", lambda: pyautogui.press("esc")),
 }
+
+
+# ---------- Custom keyboard shortcuts (made in the app, saved in settings.json) ----------
+
+SHORTCUT_PREFIX = "shortcut:"
+QT_TO_PYAUTOGUI = {"Ctrl": "ctrl", "Alt": "alt", "Shift": "shift", "Meta": "win", "Space": "space",
+                   "Esc": "esc", "Return": "enter", "Enter": "enter", "Tab": "tab", "Backspace": "backspace",
+                   "Ins": "insert", "Del": "delete", "Home": "home", "End": "end", "PgUp": "pageup",
+                   "PgDown": "pagedown", "Left": "left", "Right": "right", "Up": "up", "Down": "down",
+                   "Print": "printscreen", "Pause": "pause"}
+
+
+def shortcut_keys(text):
+    """'Ctrl+Shift+S' -> ['ctrl', 'shift', 's'] for pyautogui. Raises ValueError for unknown keys."""
+    parts = [p for p in text.replace(" ", "").split("+") if p] if text != "+" else ["+"]
+    if not parts:
+        raise ValueError("No keys given.")
+    keys = []
+    for part in parts:
+        if part in QT_TO_PYAUTOGUI:
+            keys.append(QT_TO_PYAUTOGUI[part])
+        elif part.upper().startswith("F") and part[1:].isdigit() and 1 <= int(part[1:]) <= 24:
+            keys.append(part.lower())
+        elif len(part) == 1 and part.lower() in pyautogui.KEYBOARD_KEYS:
+            keys.append(part.lower())
+        else:
+            raise ValueError(f"'{part}' isn't a key Kinesis can press.")
+    return keys
+
+
+def add_shortcut(text):
+    """Registers 'Ctrl+C' etc. as an action. Returns its action key."""
+    keys = shortcut_keys(text)
+    key = SHORTCUT_PREFIX + text
+    ACTIONS[key] = Action(f"Shortcut: {text}", "once", lambda: pyautogui.hotkey(*keys))
+    return key
+
+
+def remove_shortcut(text):
+    ACTIONS.pop(SHORTCUT_PREFIX + text, None)
+
+
+def custom_shortcuts():
+    return [key[len(SHORTCUT_PREFIX):] for key in ACTIONS if key.startswith(SHORTCUT_PREFIX)]

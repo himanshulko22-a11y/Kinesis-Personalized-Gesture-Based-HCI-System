@@ -25,7 +25,7 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 
 ## Available actions
 
-Left click, right click, double click, move cursor, volume up/down, scroll up/down, switch window (next/previous), take screenshot, mark last action as mistake, or none.
+Left click, right click, double click, move cursor, volume up/down, scroll up/down, switch window (next/previous), take screenshot, mark last action as mistake, or none. Ready-made shortcuts: media play/pause, next/previous track, mute, next/previous slide, show desktop, task view, copy, paste, undo, Enter and Escape. You can also add **any keyboard shortcut** of your own (e.g. Ctrl+S, Win+E, F5) under **Custom Shortcuts**; it is saved in `settings.json`.
 
 ## How it works
 
@@ -85,9 +85,17 @@ No trained model is included, so you start by teaching the app your gestures:
 | `camera_reset.py` | Switches the webcam back to automatic exposure |
 | `style.py` | Window theme |
 
+## Included default dataset
+
+The repository includes a ready-made default setup: **15 static hand poses** (9,000 frames, 600 per pose, recorded with both hands) with a trained model and action mapping. After downloading, click **Restore Defaults** to use it straight away, or record your own gestures instead.
+
+Poses: open_palm, fist, point, pinch, ok_sign, thumbs_up, thumbs_down, peace, three, four, rock, call_me, L_sign, point_down, pinky_up.
+
+The data contains only MediaPipe hand-landmark coordinates (21 points per frame, relative to the wrist), with no images or video. These are the `*_backup` files; **Save as Default** replaces them with your own setup.
+
 ## Files the app creates
 
-These are made next to `Kinesis_app.py` while you use the app and are not part of the repository:
+These are made next to `Kinesis_app.py` while you use the app and are not uploaded:
 
 | File | Purpose |
 |------|---------|
@@ -97,7 +105,9 @@ These are made next to `Kinesis_app.py` while you use the app and are not part o
 | `gesture_mapping.json` | Your gesture-to-action settings |
 | `activity_log.txt` | Activity log |
 | `screenshots/` | Screenshots taken by the screenshot gesture |
-| `*_backup.*` | Your saved default setup (**Save as Default**) |
+| `settings.json` | Your mistake hotkey and custom shortcuts |
+
+The `*_backup` files (your saved default setup) **are** part of the repository - see *Included default dataset* above.
 
 ## Built with
 

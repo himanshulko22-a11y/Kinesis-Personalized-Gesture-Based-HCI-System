@@ -1,12 +1,15 @@
-# Your personal data - stays on your PC, never uploaded
-gesture_data*.csv
-gesture_model*.keras
-label_encoder*.pkl
-gesture_mapping*.json
+# Working files - change every time you use the app, stay on your PC
+gesture_data.csv
+gesture_model.keras
+label_encoder.pkl
+gesture_mapping.json
 activity_log.txt*
 screenshots/
 screenshot_*.png
 settings.json
+
+# The *_backup files ARE uploaded: they are the default dataset and model
+# (what Save as Default writes and Restore Defaults loads).
 
 # Python / editor files
 __pycache__/

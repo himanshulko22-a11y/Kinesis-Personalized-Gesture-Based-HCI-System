@@ -29,7 +29,8 @@ from PyQt5.QtWidgets import (
 import config as cfg
 import gestures as g
 from camera import Camera
-from actions import ACTIONS, hotkey_pressed, load_settings, parse_hotkey, save_settings
+from actions import (ACTIONS, SHORTCUT_PREFIX, add_shortcut, custom_shortcuts, hotkey_pressed, load_settings,
+                     parse_hotkey, remove_shortcut, save_settings)
 from style import STYLESHEET
 from widgets import ConfusionMatrixDialog, GestureMappingRow, ask, button, clear_layout, note, section_title
 
@@ -80,6 +81,11 @@ class KinesisApp(QMainWindow):
         self.last_fired = None        # last action that fired, so it can be marked as a mistake
         self.hotkey_down = False
         self.settings = load_settings()
+        for text in self.settings.get("shortcuts", []):
+            try:
+                add_shortcut(text)   # before the mapping loads, so gestures can keep these actions
+            except ValueError:
+                pass
         self.mistake_hotkey = self.settings.get("mistake_hotkey", cfg.MISTAKE_HOTKEY)
         try:
             self.hotkey_codes = parse_hotkey(self.mistake_hotkey)
@@ -165,6 +171,23 @@ class KinesisApp(QMainWindow):
         self.mapping_layout = QVBoxLayout()
         self.mapping_layout.setAlignment(Qt.AlignTop)
         col.addLayout(self.mapping_layout)
+
+        col.addWidget(section_title("Custom Shortcuts"))
+        col.addWidget(note("Add any keyboard shortcut (e.g. Ctrl+S, Win+E, F5) and it appears as an action "
+                           "in Gesture Mapping. Ready-made ones like Play/Pause and Next Slide are already there."))
+        row = QHBoxLayout()
+        self.shortcut_edit = QKeySequenceEdit()
+        self.shortcut_edit.setToolTip("Click here and press the shortcut you want.")
+        row.addWidget(self.shortcut_edit)
+        row.addWidget(button("Add Shortcut", self.add_custom_shortcut))
+        col.addLayout(row)
+        row = QHBoxLayout()
+        self.shortcut_list = QListWidget()
+        self.shortcut_list.setFixedHeight(70)
+        row.addWidget(self.shortcut_list)
+        row.addWidget(button("Remove", self.remove_custom_shortcut, name="deleteBtn"))
+        col.addLayout(row)
+        self._refresh_shortcut_list()
 
         self._add_slider(col, "Confidence Threshold", 50, 95, int(self.confidence_threshold * 100),
                          lambda v: f"{v}%", lambda v: setattr(self, "confidence_threshold", v / 100))
@@ -564,6 +587,58 @@ class KinesisApp(QMainWindow):
         self.status_label.setText("Saved mistakes cleared. Retrain Model to update the model.")
         self._log("Cleared saved mistakes")
 
+    # ---------- Custom shortcuts ----------
+
+    def _refresh_shortcut_list(self):
+        self.shortcut_list.clear()
+        for text in custom_shortcuts():
+            self.shortcut_list.addItem(text)
+        if not self.shortcut_list.count():
+            self.shortcut_list.addItem("(no custom shortcuts yet)")
+
+    def _save_shortcuts(self):
+        self.settings["shortcuts"] = custom_shortcuts()
+        save_settings(self.settings)
+
+    def add_custom_shortcut(self):
+        text = self.shortcut_edit.keySequence().toString().split(",")[0].strip()
+        self.shortcut_edit.clear()
+        if not text:
+            QMessageBox.information(self, "No shortcut", "Click the box, press a shortcut, then click Add Shortcut.")
+            return
+        if text in custom_shortcuts():
+            QMessageBox.information(self, "Already added", f"'{text}' is already in your shortcuts.")
+            return
+        try:
+            add_shortcut(text)
+        except ValueError as e:
+            QMessageBox.warning(self, "Shortcut not supported", str(e))
+            return
+        self._save_shortcuts()
+        self._refresh_shortcut_list()
+        self._refresh_mapping_rows()
+        self.status_label.setText(f"Added shortcut {text} - pick it for a gesture in Gesture Mapping.")
+        self._log(f"Custom shortcut added: {text}")
+
+    def remove_custom_shortcut(self):
+        item = self.shortcut_list.currentItem()
+        if item is None or item.text() not in custom_shortcuts():
+            QMessageBox.information(self, "Nothing selected", "Select a shortcut in the list first.")
+            return
+        text = item.text()
+        users = [g2 for g2, a in self.gesture_mapping.items() if a == SHORTCUT_PREFIX + text]
+        if users and not ask(self, "Remove shortcut?", f"'{text}' is used by {', '.join(users)}. "
+                                                      f"Remove it and set those gestures to None?"):
+            return
+        remove_shortcut(text)
+        for gesture in users:
+            self.gesture_mapping[gesture] = "none"
+        g.save_mapping(self.gesture_mapping)
+        self._save_shortcuts()
+        self._refresh_shortcut_list()
+        self._refresh_mapping_rows()
+        self._log(f"Custom shortcut removed: {text}")
+
     def on_hotkey_changed(self):
         text = self.hotkey_edit.keySequence().toString().split(",")[0].strip()
         if not text or text == self.mistake_hotkey:
@@ -584,7 +659,7 @@ class KinesisApp(QMainWindow):
 
     def _check_mistake_hotkey(self):
         """The mistake hotkey works from any app (Windows only)."""
-        if sys.platform != "win32" or self.hotkey_edit.hasFocus():
+        if sys.platform != "win32" or self.hotkey_edit.hasFocus() or self.shortcut_edit.hasFocus():
             return   # not while the user is choosing a new hotkey
         down = hotkey_pressed(self.hotkey_codes)
         if down and not self.hotkey_down:
