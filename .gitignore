@@ -6,6 +6,7 @@ gesture_mapping*.json
 activity_log.txt*
 screenshots/
 screenshot_*.png
+settings.json
 
 # Python / editor files
 __pycache__/

@@ -17,12 +17,15 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 - **Idle lock and unlock:** the app locks itself when no hand is seen for a while, and you unlock it by holding a chosen gesture (or with a button).
 - **Confidence threshold:** set how sure the model must be before an action fires.
 - **Built-in model tools:** dataset info, dataset balancing, optional data augmentation, a self-test for accuracy, and a confusion matrix.
+- **Similar-gesture warning:** right after you record a gesture, Kinesis compares its hand shape with your other gestures and warns you if they're too alike, before you train.
+- **Learning from mistakes:** if a gesture fires by accident, mark it within 5 seconds (button, the mistake hotkey - **Z** by default, changeable in the app - or a gesture mapped to *Mark Last Action as Mistake*). That hand shape is saved as "not a gesture", and the model learns not to fire on it at the next retrain.
+- **Speed readout:** camera FPS, app FPS and time per step, shown on the video.
 - **Activity log:** see what the app did and when.
 - **Safety options:** pause recognition at any time, reset all data, and save or restore a default setup. Gestures never fire while a dialog is open.
 
 ## Available actions
 
-Left click, right click, double click, move cursor, volume up/down, scroll up/down, switch window (next/previous), take screenshot, or none.
+Left click, right click, double click, move cursor, volume up/down, scroll up/down, switch window (next/previous), take screenshot, mark last action as mistake, or none.
 
 ## How it works
 
@@ -78,6 +81,8 @@ No trained model is included, so you start by teaching the app your gestures:
 | `widgets.py` | Small UI pieces: buttons, mapping row, confusion matrix |
 | `camera.py` | Reads the webcam in a background thread so the app always gets the newest frame |
 | `config.py` | All settings and file paths |
+| `camera_test.py` | Measures which camera mode is fastest on your webcam |
+| `camera_reset.py` | Switches the webcam back to automatic exposure |
 | `style.py` | Window theme |
 
 ## Files the app creates

@@ -22,6 +22,7 @@ ENCODER_PATH = _path("label_encoder.pkl")
 MAPPING_PATH = _path("gesture_mapping.json")
 LOG_PATH = _path("activity_log.txt")
 SCREENSHOT_DIR = _path("screenshots")
+SETTINGS_PATH = _path("settings.json")   # choices made in the app, e.g. the mistake hotkey
 ICON_PATH = os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "favicon.ico")
 
 DATA_FILES = [CSV_PATH, MODEL_PATH, ENCODER_PATH, MAPPING_PATH]
@@ -34,6 +35,19 @@ RELEASE_FRAMES = 6            # frames without a gesture before a one-shot actio
 ACTION_COOLDOWN = 1.0         # seconds before the same one-shot action can repeat
 REPEAT_COOLDOWN = 0.3         # seconds between repeats of volume/scroll while held
 FRAMES_PER_RECORDING = 150
+
+# Training
+TRAIN_WITH_AUGMENTATION = False   # starting state of the "Train with data augmentation" checkbox
+
+# Similar-gesture warning (hand-shape distance, see gestures.similarity_warning)
+SIMILAR_SAME = 0.6            # below this, a new gesture looks almost the same as an existing one
+SIMILAR_CLOSE = 1.0           # below this, it is quite similar (two takes of one gesture are ~0.2-0.5)
+
+# Learning from mistakes
+MISTAKE_FRAMES = 10           # hand frames saved when an action is marked as a mistake
+MISTAKE_WINDOW = 5.0          # seconds after an action during which it can be marked as a mistake
+MISTAKE_HOTKEY = "Z"          # default; change it in the app (e.g. "F9", "Ctrl+Alt+Z")
+MIN_MISTAKE_FRAMES = 20       # saved mistake frames needed before training uses them
 
 # Actions
 VOLUME_PRESSES = 3

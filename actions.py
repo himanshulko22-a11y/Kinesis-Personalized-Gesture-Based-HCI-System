@@ -1,4 +1,5 @@
 """What each gesture can do on the computer."""
+import json
 import os
 import time
 from collections import namedtuple
@@ -27,6 +28,59 @@ def _screenshot():
     pyautogui.screenshot(os.path.join(cfg.SCREENSHOT_DIR, name))
 
 
+# ---------- Mistake hotkey (Windows virtual-key codes, checked from any app) ----------
+
+MODIFIER_KEYS = {"Ctrl": 0x11, "Alt": 0x12, "Shift": 0x10, "Meta": 0x5B}
+NAMED_KEYS = {"Space": 0x20, "Esc": 0x1B, "Ins": 0x2D, "Del": 0x2E, "Home": 0x24, "End": 0x23,
+              "PgUp": 0x21, "PgDown": 0x22, "Left": 0x25, "Up": 0x26, "Right": 0x27, "Down": 0x28,
+              "Pause": 0x13, "ScrollLock": 0x91}
+
+
+def parse_hotkey(text):
+    """'Ctrl+Alt+Z' -> [0x11, 0x12, 0x5A]. Raises ValueError for keys it can't watch."""
+    parts = [p for p in text.replace(" ", "").split("+") if p]
+    if not parts:
+        raise ValueError("No key given.")
+    *modifiers, key = parts
+    codes = []
+    for m in modifiers:
+        if m not in MODIFIER_KEYS:
+            raise ValueError(f"'{m}' can't be used as a modifier.")
+        codes.append(MODIFIER_KEYS[m])
+    if len(key) == 1 and key.upper().isalnum():
+        codes.append(ord(key.upper()))                 # letters and digits
+    elif key.upper().startswith("F") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
+        codes.append(0x70 + int(key[1:]) - 1)          # F1-F24
+    elif key in NAMED_KEYS:
+        codes.append(NAMED_KEYS[key])
+    else:
+        raise ValueError(f"'{key}' isn't supported - use a letter, digit, F1-F24 or a key like Space/Home.")
+    return codes
+
+
+def hotkey_pressed(codes):
+    """True while exactly this combination is held (other modifiers must be up, so 'Z' doesn't fire on Ctrl+Z)."""
+    import ctypes
+    state = ctypes.windll.user32.GetAsyncKeyState
+    if not all(state(code) & 0x8000 for code in codes):
+        return False
+    return not any(state(m) & 0x8000 for m in MODIFIER_KEYS.values() if m not in codes)
+
+
+def load_settings():
+    try:
+        with open(cfg.SETTINGS_PATH) as f:
+            settings = json.load(f)
+        return settings if isinstance(settings, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    with open(cfg.SETTINGS_PATH, "w") as f:
+        json.dump(settings, f, indent=2)
+
+
 ACTIONS = {
     "none":               Action("None (unhooked)", "once", None),
     "left_click":         Action("Left Click", "once", lambda: pyautogui.click(button="left")),
@@ -40,4 +94,5 @@ ACTIONS = {
     "switch_window_prev": Action("Switch Window (Previous)", "once", lambda: pyautogui.hotkey("alt", "shift", "tab")),
     "scroll_up":          Action("Scroll Up", "repeat", lambda: pyautogui.scroll(cfg.SCROLL_AMOUNT)),
     "scroll_down":        Action("Scroll Down", "repeat", lambda: pyautogui.scroll(-cfg.SCROLL_AMOUNT)),
+    "mark_mistake":       Action("Mark Last Action as Mistake", "once", None),   # handled by the app
 }

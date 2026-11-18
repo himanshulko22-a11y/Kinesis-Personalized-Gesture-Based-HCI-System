@@ -14,6 +14,7 @@ import pandas as pd
 import config as cfg
 from actions import ACTIONS
 
+NONE_LABEL = "_not_a_gesture"   # frames from corrected mistakes: "this is none of my gestures"
 CSV_HEADER = ["label"] + [f"{axis}{i}" for i in range(21) for axis in ("x", "y", "z")]
 
 
@@ -133,9 +134,11 @@ class HandState:
         self.recent = deque(maxlen=cfg.SMOOTHING_WINDOW)
         self.latched = None        # one-shot gesture that already fired and hasn't been released
         self.frames_released = 0
+        self.features = deque(maxlen=cfg.MISTAKE_FRAMES)   # recent hand frames, saved if a mistake is marked
 
     def reset(self):
         self.recent.clear()
+        self.features.clear()
         self.latched = None
         self.frames_released = 0
 
@@ -152,6 +155,57 @@ class HandState:
         if len(self.recent) == self.recent.maxlen and len(set(self.recent)) == 1:
             return self.recent[0]
         return None
+
+
+# ---------- Similar-gesture warning ----------
+
+def hand_shape(frames):
+    """Hand shape only: x/y scaled to one hand size, so distance from the camera and depth don't count."""
+    points = np.asarray(frames, dtype=np.float32).reshape(-1, 21, 3)[:, :, :2]
+    size = np.linalg.norm(points[:, 9], axis=1) + 1e-9   # wrist -> base of middle finger
+    return (points / size[:, None, None]).reshape(len(points), -1)
+
+
+def _median_nearest(A, B):
+    """Median, over frames in A, of the distance to the closest frame in B."""
+    squared = (A ** 2).sum(1)[:, None] + (B ** 2).sum(1)[None, :] - 2 * A @ B.T
+    return float(np.median(np.sqrt(np.maximum(squared.min(axis=1), 0))))
+
+
+def gesture_similarity(new_frames, df):
+    """Hand-shape distance from a new recording to each recorded gesture (smaller = more alike).
+    A mirrored hand counts as the same shape, as in training."""
+    new = np.asarray(new_frames, dtype=np.float32)
+    mirrored = new.copy()
+    mirrored[:, 0::3] *= -1
+    shapes = (hand_shape(new), hand_shape(mirrored))
+    distances = {}
+    for gesture, group in df[df["label"] != NONE_LABEL].groupby("label"):
+        reference = hand_shape(group.drop(columns="label").values)
+        distances[gesture] = min(_median_nearest(s, reference) for s in shapes)
+    return dict(sorted(distances.items(), key=lambda item: item[1]))
+
+
+def similarity_warning(name, new_frames):
+    """Returns (level, message) if a new recording is too much like another gesture
+    (or unlike its own earlier recordings), else None. level is "strong" or "mild"."""
+    df = read_dataset()
+    if df is None or not len(new_frames):
+        return None
+    distances = gesture_similarity(new_frames, df)
+    own = distances.pop(name, None)
+    for other, distance in distances.items():   # closest first
+        if distance < cfg.SIMILAR_SAME:
+            return "strong", (f"This looks almost the same as '{other}' (difference {distance:.2f}). "
+                              f"The model will mix them up - use a more different hand shape, or Retake.")
+        if distance < cfg.SIMILAR_CLOSE:
+            return "mild", (f"This is quite similar to '{other}' (difference {distance:.2f}). "
+                            f"It may sometimes be confused - check with Self-Test after training.")
+        break
+    if own is not None and own > cfg.SIMILAR_CLOSE:
+        return "mild", (f"This take looks different from your earlier '{name}' recordings "
+                        f"(difference {own:.2f}). Is it really the same gesture?")
+    return None
 
 
 # ---------- Dataset ----------
@@ -204,9 +258,12 @@ def train_model(augment=True):
     from tensorflow.keras import layers
 
     df = read_dataset()
-    if df is None or df["label"].nunique() < 2:
+    if df is not None and (df["label"] == NONE_LABEL).sum() < cfg.MIN_MISTAKE_FRAMES:
+        df = df[df["label"] != NONE_LABEL]   # too few saved mistakes to learn from yet
+    real = df[df["label"] != NONE_LABEL] if df is not None else None
+    if real is None or real["label"].nunique() < 2:
         raise ValueError("Record at least 2 different gestures before training.")
-    counts = df["label"].value_counts()
+    counts = real["label"].value_counts()
     if counts.min() < 10:
         raise ValueError(f"'{counts.idxmin()}' has only {counts.min()} frames - record it again.")
 
@@ -238,7 +295,12 @@ def train_model(augment=True):
 
 def predict(model, encoder, hand):
     """Returns (gesture_name, confidence) for one hand."""
-    features = np.array([normalize_landmarks(hand)], dtype=np.float32)
+    return predict_features(model, encoder, normalize_landmarks(hand))
+
+
+def predict_features(model, encoder, features):
+    """Same as predict(), from already-normalized landmarks."""
+    features = np.array([features], dtype=np.float32)
     probabilities = np.asarray(model(features, training=False))[0]   # much faster than model.predict() per frame
     best = int(np.argmax(probabilities))
     return encoder.classes_[best], float(probabilities[best])
@@ -269,6 +331,8 @@ def load_mapping(known_gestures):
             used.add(action)
     for gesture in known_gestures:
         mapping.setdefault(gesture, "none")
+    if NONE_LABEL in mapping:
+        mapping[NONE_LABEL] = "none"   # "not a gesture" never does anything
 
     save_mapping(mapping)
     return mapping

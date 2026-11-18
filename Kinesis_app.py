@@ -17,18 +17,19 @@ import time
 
 import cv2
 import mediapipe as mp
+import pandas as pd
 import pyautogui
 from PyQt5.QtCore import Qt, QTimer, QUrl
-from PyQt5.QtGui import QDesktopServices, QIcon, QImage, QPixmap
+from PyQt5.QtGui import QDesktopServices, QIcon, QImage, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
     QMainWindow, QMessageBox, QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 
 import config as cfg
 import gestures as g
 from camera import Camera
-from actions import ACTIONS
+from actions import ACTIONS, hotkey_pressed, load_settings, parse_hotkey, save_settings
 from style import STYLESHEET
 from widgets import ConfusionMatrixDialog, GestureMappingRow, ask, button, clear_layout, note, section_title
 
@@ -76,6 +77,14 @@ class KinesisApp(QMainWindow):
         self.last_frame_time = time.time()
         self.unlock_hold_start = None
         self.unlock_gesture = None
+        self.last_fired = None        # last action that fired, so it can be marked as a mistake
+        self.hotkey_down = False
+        self.settings = load_settings()
+        self.mistake_hotkey = self.settings.get("mistake_hotkey", cfg.MISTAKE_HOTKEY)
+        try:
+            self.hotkey_codes = parse_hotkey(self.mistake_hotkey)
+        except ValueError:
+            self.mistake_hotkey, self.hotkey_codes = cfg.MISTAKE_HOTKEY, parse_hotkey(cfg.MISTAKE_HOTKEY)
 
         self._build_ui()
         if load_error:
@@ -202,7 +211,7 @@ class KinesisApp(QMainWindow):
         self.name_input.setPlaceholderText("e.g. fist")
         col.addWidget(self.name_input)
         self.augment_box = QCheckBox("Train with data augmentation")
-        self.augment_box.setChecked(True)
+        self.augment_box.setChecked(cfg.TRAIN_WITH_AUGMENTATION)
         self.augment_box.setToolTip("Adds jittered and mirrored copies of each frame when training.")
         col.addWidget(self.augment_box)
 
@@ -226,6 +235,27 @@ class KinesisApp(QMainWindow):
         self.cancel_btn = button("Cancel", self.cancel_recording, name="deleteBtn")
         for widget in (self.status_label, self.retake_btn, self.cancel_btn):
             row.addWidget(widget)
+        col.addLayout(row)
+        self.warning_label = QLabel("")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.hide()
+        col.addWidget(self.warning_label)
+
+        col.addWidget(section_title("Learning From Mistakes"))
+        col.addWidget(note("Did a gesture fire by accident? Mark it within a few seconds (button, the "
+                           "hotkey below, or a gesture mapped to 'Mark Last Action as Mistake'). "
+                           "That hand shape is saved as 'not a gesture', and the model learns it on the next Retrain."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Mistake hotkey:"))
+        self.hotkey_edit = QKeySequenceEdit(QKeySequence(self.mistake_hotkey))
+        self.hotkey_edit.setToolTip("Click here, press the key or combination you want, then click elsewhere. "
+                                    "It works from any app.")
+        self.hotkey_edit.editingFinished.connect(self.on_hotkey_changed)
+        row.addWidget(self.hotkey_edit)
+        col.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(button("That Was a Mistake", lambda: self.mark_mistake("button")))
+        row.addWidget(button("Clear Saved Mistakes", self.clear_mistakes, name="deleteBtn"))
         col.addLayout(row)
 
         danger = section_title("Danger Zone")
@@ -275,10 +305,19 @@ class KinesisApp(QMainWindow):
             self.dataset_layout.addWidget(QLabel("No data recorded yet."))
             return
         counts = df["label"].value_counts()
+        mistakes = int(counts.get(g.NONE_LABEL, 0))
+        counts = counts.drop(g.NONE_LABEL, errors="ignore")
         total = QLabel(f"Total frames: {len(df)}")
         total.setStyleSheet("font-weight: bold; color: #c9a8ff;")
         self.dataset_layout.addWidget(total)
-        average = len(df) / len(counts)
+        if mistakes:
+            used = "used in training" if mistakes >= cfg.MIN_MISTAKE_FRAMES else \
+                f"used once there are {cfg.MIN_MISTAKE_FRAMES}"
+            label = QLabel(f"not a gesture (from {mistakes // cfg.MISTAKE_FRAMES} corrected mistakes): "
+                           f"{mistakes} frames, {used}")
+            label.setStyleSheet("color: #9d8ec2;")
+            self.dataset_layout.addWidget(label)
+        average = counts.sum() / max(len(counts), 1)
         for gesture, count in counts.items():
             low = count < average * 0.5
             label = QLabel(f"{gesture}: {count} frames" + ("  (low - consider recording more)" if low else ""))
@@ -291,6 +330,8 @@ class KinesisApp(QMainWindow):
             self.mapping_layout.addWidget(QLabel("No gestures trained yet."))
             return
         for gesture in self.encoder.classes_:
+            if gesture == g.NONE_LABEL:
+                continue
             self.mapping_layout.addWidget(GestureMappingRow(
                 gesture, self.gesture_mapping.get(gesture, "none"),
                 self.on_mapping_changed, self._begin_recording, self.delete_gesture))
@@ -300,7 +341,8 @@ class KinesisApp(QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         for gesture in (self.encoder.classes_ if self.encoder is not None else []):
-            combo.addItem(gesture, userData=gesture)
+            if gesture != g.NONE_LABEL:
+                combo.addItem(gesture, userData=gesture)
         if combo.count() == 0:
             combo.addItem("(no gestures trained)", userData=None)
         for choice in (self.unlock_gesture, "open_palm"):
@@ -422,6 +464,9 @@ class KinesisApp(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Missing name", "Type a gesture name first.")
             return
+        if name.startswith("_"):
+            QMessageBox.warning(self, "Name not allowed", "Gesture names can't start with '_'.")
+            return
         self._begin_recording(name)
 
     def _begin_recording(self, name):
@@ -432,6 +477,7 @@ class KinesisApp(QMainWindow):
         self._clear_prediction_state()   # also releases a held Ctrl from zoom
         self.mode = "recording"
         self._set_recording_buttons()
+        self.warning_label.hide()
         self.status_label.setText(f"Recording '{name}'... hold your gesture with one hand.")
 
     def _record_frame(self, hands):
@@ -447,6 +493,23 @@ class KinesisApp(QMainWindow):
             self.status_label.setText(
                 f"Captured {len(self.recording_buffer)} frames for '{self.new_gesture_name}'. "
                 f"Save Gesture to keep it, or Retake.")
+            self._show_similarity_warning()
+
+    def _show_similarity_warning(self):
+        try:
+            warning = g.similarity_warning(self.new_gesture_name, self.recording_buffer)
+        except Exception as e:
+            warning = None
+            self._log(f"Similarity check failed: {e}")
+        if warning is None:
+            self.warning_label.setText("✓ Looks clearly different from your other gestures.")
+            self.warning_label.setStyleSheet("color: #7ee787;")
+        else:
+            level, message = warning
+            self.warning_label.setText(("⚠ " if level == "strong" else "ℹ ") + message)
+            self.warning_label.setStyleSheet(f"color: {'#ff9eb0' if level == 'strong' else '#ffb08a'};")
+            self._log(f"Similarity check for '{self.new_gesture_name}': {message}")
+        self.warning_label.show()
 
     def save_recording(self):
         g.append_recording(self.new_gesture_name, self.recording_buffer)
@@ -454,6 +517,7 @@ class KinesisApp(QMainWindow):
         self.recording_buffer = []
         self.mode = "normal"
         self._set_recording_buttons()
+        self.warning_label.hide()
         self._refresh_dataset_info()
         self.status_label.setText(f"Saved {count} frames for '{self.new_gesture_name}'. "
                                   f"Record more takes for variety, or Retrain Model when ready.")
@@ -464,7 +528,68 @@ class KinesisApp(QMainWindow):
         self.mode = "normal"
         self.last_activity_time = time.time()
         self._set_recording_buttons()
+        self.warning_label.hide()
         self.status_label.setText("Recording cancelled.")
+
+    # ---------- Learning from mistakes ----------
+
+    def mark_mistake(self, source):
+        """Saves the hand frames behind the last action as 'not a gesture'."""
+        fired = self.last_fired
+        if fired is None or time.time() - fired["time"] > cfg.MISTAKE_WINDOW:
+            self.status_label.setText(f"No action in the last {cfg.MISTAKE_WINDOW:.0f} seconds to mark as a mistake.")
+            return
+        self.last_fired = None
+        g.append_recording(g.NONE_LABEL, fired["frames"])
+        df = g.read_dataset()
+        saved = int((df["label"] == g.NONE_LABEL).sum()) if df is not None else 0
+        need = max(0, cfg.MIN_MISTAKE_FRAMES - saved)
+        self.status_label.setText(
+            f"Got it - that '{fired['gesture']}' was a mistake. " +
+            (f"Mark {need // cfg.MISTAKE_FRAMES + (need % cfg.MISTAKE_FRAMES > 0)} more, then Retrain to learn them."
+             if need else "Retrain Model to learn from your corrections."))
+        self._log(f"Mistake marked ({source}): {fired['hand']} hand {fired['gesture']} -> {fired['action']}, "
+                  f"{len(fired['frames'])} frames saved as not-a-gesture ({saved} total)")
+        self._refresh_dataset_info()
+
+    def clear_mistakes(self):
+        df = g.read_dataset()
+        if df is None or not (df["label"] == g.NONE_LABEL).any():
+            QMessageBox.information(self, "No mistakes", "No corrected mistakes are saved.")
+            return
+        if not ask(self, "Clear saved mistakes?", "Delete all frames saved from corrected mistakes?"):
+            return
+        df[df["label"] != g.NONE_LABEL].to_csv(cfg.CSV_PATH, index=False)
+        self._refresh_dataset_info()
+        self.status_label.setText("Saved mistakes cleared. Retrain Model to update the model.")
+        self._log("Cleared saved mistakes")
+
+    def on_hotkey_changed(self):
+        text = self.hotkey_edit.keySequence().toString().split(",")[0].strip()
+        if not text or text == self.mistake_hotkey:
+            self.hotkey_edit.setKeySequence(QKeySequence(self.mistake_hotkey))
+            return
+        try:
+            codes = parse_hotkey(text)
+        except ValueError as e:
+            QMessageBox.warning(self, "Hotkey not supported", str(e))
+            self.hotkey_edit.setKeySequence(QKeySequence(self.mistake_hotkey))
+            return
+        self.mistake_hotkey, self.hotkey_codes = text, codes
+        self.hotkey_down = True   # don't fire on the key press that set it
+        self.settings["mistake_hotkey"] = text
+        save_settings(self.settings)
+        self.status_label.setText(f"Mistake hotkey is now {text}.")
+        self._log(f"Mistake hotkey changed to {text}")
+
+    def _check_mistake_hotkey(self):
+        """The mistake hotkey works from any app (Windows only)."""
+        if sys.platform != "win32" or self.hotkey_edit.hasFocus():
+            return   # not while the user is choosing a new hotkey
+        down = hotkey_pressed(self.hotkey_codes)
+        if down and not self.hotkey_down:
+            self.mark_mistake(self.mistake_hotkey)
+        self.hotkey_down = down
 
     # ---------- Training and data management ----------
 
@@ -491,6 +616,8 @@ class KinesisApp(QMainWindow):
 
     def balance_dataset(self):
         df = g.read_dataset()
+        mistakes = df[df["label"] == g.NONE_LABEL] if df is not None else None
+        df = df[df["label"] != g.NONE_LABEL] if df is not None else None   # saved mistakes are kept as they are
         if df is None or df["label"].nunique() < 2:
             QMessageBox.warning(self, "Not enough data", "Record at least 2 gestures first.")
             return
@@ -502,14 +629,15 @@ class KinesisApp(QMainWindow):
         if not ask(self, "Balance dataset?", f"Trim every gesture down to {smallest} frames? "
                                              f"Extra frames are permanently deleted."):
             return
-        df.groupby("label").sample(n=smallest, random_state=42).to_csv(cfg.CSV_PATH, index=False)
+        balanced = df.groupby("label").sample(n=smallest, random_state=42)
+        pd.concat([balanced, mistakes]).to_csv(cfg.CSV_PATH, index=False)
         self._retrain(f"Balanced to {smallest} frames per gesture and retrained.")
 
     def delete_gesture(self, gesture):
         df = g.read_dataset()
         if df is None:
             return
-        if df["label"].nunique() <= 2:
+        if df.loc[df["label"] != g.NONE_LABEL, "label"].nunique() <= 2:
             QMessageBox.warning(self, "Cannot delete", "You need at least 2 gestures to train. "
                                                        "Add another gesture before deleting this one.")
             return
@@ -617,6 +745,7 @@ class KinesisApp(QMainWindow):
     def _process_frame(self):
         while self.camera.messages:
             self._log(self.camera.messages.pop(0))
+        self._check_mistake_hotkey()
         frame, self.frame_id = self.camera.latest(self.frame_id)
         if frame is None:   # no new frame yet
             if time.time() - self.camera.last_frame_time > 3 and self.camera.is_opened():
@@ -743,7 +872,8 @@ class KinesisApp(QMainWindow):
         for label, landmarks in hands:
             gesture, confidence, action_key = self._process_hand(label, landmarks)
             action_keys[label] = action_key
-            parts.append(f"{label}: {gesture} ({confidence:.0%})" if gesture else f"{label}: none")
+            shown = "not a gesture" if gesture == g.NONE_LABEL else gesture
+            parts.append(f"{label}: {shown} ({confidence:.0%})" if gesture else f"{label}: none")
         for label, state in self.hand_states.items():
             if label not in action_keys:
                 state.push(None)
@@ -761,8 +891,10 @@ class KinesisApp(QMainWindow):
 
     def _process_hand(self, label, landmarks):
         """Predicts one hand's gesture and runs its action. Returns (stable_gesture, confidence, action_key)."""
-        gesture, confidence = g.predict(self.model, self.encoder, landmarks)
+        features = g.normalize_landmarks(landmarks)
+        gesture, confidence = g.predict_features(self.model, self.encoder, features)
         state = self.hand_states[label]
+        state.features.append(features)
         state.push(gesture if confidence >= self.confidence_threshold else None)
         stable = state.stable()
         if stable is None:
@@ -783,8 +915,13 @@ class KinesisApp(QMainWindow):
                 self.last_action_time[action_key] = now
                 if action.kind == "once":
                     state.latched, state.frames_released = stable, 0   # don't repeat while held
+                if action_key == "mark_mistake":
+                    self.mark_mistake(f"{stable} gesture")
+                    return stable, confidence, action_key
                 try:
                     action.fn()
+                    self.last_fired = {"time": now, "hand": label, "gesture": stable,
+                                       "action": action.label, "frames": list(state.features)}
                     self.last_action_label.setText(f"Last action: {label} hand {stable} -> {action.label}")
                     self._log(f"{label} hand: {stable} -> {action.label}")
                 except Exception as e:
