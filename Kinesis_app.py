@@ -7,6 +7,7 @@ Files:
   actions.py   what a gesture can do (click, volume, scroll...)
   gestures.py  landmarks, dataset, model training, gesture -> action mapping
   widgets.py   small UI pieces (buttons, mapping row, confusion matrix)
+  camera.py    webcam reader (background thread)
   style.py     window theme
 """
 import os
@@ -26,6 +27,7 @@ from PyQt5.QtWidgets import (
 
 import config as cfg
 import gestures as g
+from camera import Camera
 from actions import ACTIONS
 from style import STYLESHEET
 from widgets import ConfusionMatrixDialog, GestureMappingRow, ask, button, clear_layout, note, section_title
@@ -49,14 +51,16 @@ class KinesisApp(QMainWindow):
         load_error = self._load_model()
 
         self.hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.7)
-        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-        self.cap = cv2.VideoCapture(cfg.CAMERA_INDEX, backend)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.camera = Camera()
+        self.frame_id = 0
+        self.timing = {"app_fps": 0.0, "tracking": 0.0, "gestures": 0.0, "display": 0.0}   # running averages
+        self.last_processed = time.perf_counter()
 
         self.hand_states = {"Left": g.HandState(), "Right": g.HandState()}
+        self.cursor = g.CursorSmoother()
+        self.cursor_used = False
+        self.show_speed = True
         self.last_action_time = {}
-        self.failed_reads = 0
         self.last_loop_error = None
         self.confidence_threshold = cfg.CONFIDENCE_THRESHOLD
         self.cursor_sensitivity = 50
@@ -76,7 +80,7 @@ class KinesisApp(QMainWindow):
         self._build_ui()
         if load_error:
             self.status_label.setText(f"Saved model couldn't be loaded ({load_error}). Retrain or Restore Defaults.")
-        elif not self.cap.isOpened():
+        elif not self.camera.is_opened():
             self.status_label.setText("Camera not found - check it's connected and not used by another app.")
 
         self.timer = QTimer()
@@ -158,6 +162,10 @@ class KinesisApp(QMainWindow):
         self._add_slider(col, "Cursor Sensitivity", 1, 100, self.cursor_sensitivity,
                          str, lambda v: setattr(self, "cursor_sensitivity", v),
                          "Higher = less hand movement to reach the screen edges (faster, less precise).")
+        self._add_slider(col, "Cursor Steadiness", 0, 100, cfg.CURSOR_STEADINESS,
+                         str, self.cursor.set_steadiness,
+                         "Higher = the cursor stays perfectly still against small hand shake, "
+                         "but needs a slightly bigger movement to start moving.")
 
         col.addWidget(section_title("Advanced Gestures"))
         zoom_box = QCheckBox("Two hands apart/together = Zoom in/out")
@@ -167,6 +175,10 @@ class KinesisApp(QMainWindow):
         col.addWidget(zoom_box)
         col.addWidget(note("Each hand is recognized separately, so the left hand can move the "
                            "cursor while the right hand clicks."))
+        speed_box = QCheckBox("Show speed (FPS and timing) on video")
+        speed_box.setChecked(self.show_speed)
+        speed_box.stateChanged.connect(lambda state: setattr(self, "show_speed", state == Qt.Checked))
+        col.addWidget(speed_box)
         col.addWidget(button("Open Screenshots Folder", self.open_screenshots_folder))
 
         col.addWidget(section_title("Activity Log"))
@@ -334,6 +346,7 @@ class KinesisApp(QMainWindow):
     def _clear_prediction_state(self):
         for state in self.hand_states.values():
             state.reset()
+        self.cursor.reset()
         self._reset_zoom()
 
     # ---------- Lock ----------
@@ -602,17 +615,19 @@ class KinesisApp(QMainWindow):
                 self._log(f"Error: {e}")
 
     def _process_frame(self):
-        ok, frame = self.cap.read()
-        if not ok:
-            self.failed_reads += 1
-            if self.failed_reads == 30:
+        while self.camera.messages:
+            self._log(self.camera.messages.pop(0))
+        frame, self.frame_id = self.camera.latest(self.frame_id)
+        if frame is None:   # no new frame yet
+            if time.time() - self.camera.last_frame_time > 3 and self.camera.is_opened():
                 self.status_label.setText("Camera not returning frames - check it's connected and not used by another app.")
             return
-        self.failed_reads = 0
 
+        t0 = time.perf_counter()
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         hands = self._find_hands(self.hands.process(rgb), frame)
+        t1 = time.perf_counter()
 
         now = time.time()
         if now - self.last_frame_time > 2.0 or self.paused or self.mode in ("recording", "reviewing"):
@@ -625,12 +640,37 @@ class KinesisApp(QMainWindow):
             self._update_locked(hands)
         elif self.mode == "normal":
             self._update_normal(hands, now)
+        t2 = time.perf_counter()
 
+        if self.show_speed:
+            self._draw_speed(frame)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         image = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self.video_label.setPixmap(QPixmap.fromImage(image).scaled(
             self.video_label.width(), self.video_label.height(), Qt.KeepAspectRatio))
+        t3 = time.perf_counter()
+        self._update_timing(t0, t1, t2, t3)
+
+    def _update_timing(self, t0, t1, t2, t3):
+        """Running averages of how long each step takes, in milliseconds."""
+        smooth = lambda old, new: 0.9 * old + 0.1 * new
+        timing = self.timing
+        timing["app_fps"] = smooth(timing["app_fps"], 1 / max(t3 - self.last_processed, 1e-3))
+        timing["tracking"] = smooth(timing["tracking"], (t1 - t0) * 1000)
+        timing["gestures"] = smooth(timing["gestures"], (t2 - t1) * 1000)
+        timing["display"] = smooth(timing["display"], (t3 - t2) * 1000)
+        self.last_processed = t3
+
+    def _draw_speed(self, frame):
+        t = self.timing
+        lines = [f"Camera {self.camera.fps:4.1f} fps ({self.camera.backend})   App {t['app_fps']:4.1f} fps",
+                 f"Hand tracking {t['tracking']:4.1f} ms",
+                 f"Gestures+actions {t['gestures']:4.1f} ms",
+                 f"Display {t['display']:4.1f} ms"]
+        for i, text in enumerate(lines):
+            y = 22 + i * 20
+            cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 255, 120), 1, cv2.LINE_AA)
 
     def _find_hands(self, results, frame):
         """Returns [(label, landmarks)] and draws the hands on the frame."""
@@ -699,6 +739,7 @@ class KinesisApp(QMainWindow):
             self.confidence_label.setText("Confidence: -")
 
         action_keys, parts = {}, []
+        self.cursor_used = False
         for label, landmarks in hands:
             gesture, confidence, action_key = self._process_hand(label, landmarks)
             action_keys[label] = action_key
@@ -706,6 +747,8 @@ class KinesisApp(QMainWindow):
         for label, state in self.hand_states.items():
             if label not in action_keys:
                 state.push(None)
+        if not self.cursor_used:
+            self.cursor.reset()   # next time the cursor starts fresh from the hand's position
         if hands:
             self.gesture_label.setText("Gesture -> " + "  |  ".join(parts))
             self.confidence_label.setText(f"Hands detected: {len(hands)}")
@@ -728,7 +771,11 @@ class KinesisApp(QMainWindow):
         action_key = self.gesture_mapping.get(stable, "none")
         action = ACTIONS[action_key]
         if action.kind == "cursor":
-            pyautogui.moveTo(*g.cursor_position(landmarks, self.cursor_sensitivity, SCREEN_W, SCREEN_H))
+            self.cursor_used = True
+            target = g.cursor_position(landmarks, self.cursor_sensitivity, SCREEN_W, SCREEN_H)
+            position = self.cursor.update(*target, time.time())
+            if position is not None:
+                pyautogui.moveTo(*position)
         elif action_key != "none" and not (action.kind == "once" and state.latched == stable):
             cooldown = cfg.ACTION_COOLDOWN if action.kind == "once" else cfg.REPEAT_COOLDOWN
             now = time.time()
@@ -778,7 +825,7 @@ class KinesisApp(QMainWindow):
     def closeEvent(self, event):
         self.timer.stop()
         self._release_zoom_ctrl()
-        self.cap.release()
+        self.camera.release()
         self.hands.close()
         event.accept()
 

@@ -44,6 +44,13 @@ ACTIVE_ZONE_X = (0.15, 0.85)
 ACTIVE_ZONE_Y = (0.15, 0.65)
 EDGE_BUFFER = 5               # pixels kept away from the screen edge
 
+# Cursor smoothing (One Euro filter + hold zone, see CursorSmoother in gestures.py)
+CURSOR_MIN_CUTOFF = 1.0       # lower = smoother but slower to follow slow movements
+CURSOR_BETA = 0.01            # higher = less lag during fast movements
+CURSOR_STILL_SPEED = 120      # pixels/second; slower than this counts as stopped
+CURSOR_HOLD_RADIUS = (4, 24)  # pixels a still cursor ignores, for steadiness slider 0..100
+CURSOR_STEADINESS = 50        # default slider value
+
 # Two-hand zoom
 ZOOM_DEADZONE = 0.0015        # hand-distance changes smaller than this are noise
 ZOOM_SENSITIVITY = 6000       # turns hand-distance change into a scroll amount
@@ -58,8 +65,13 @@ UNLOCK_HOLD_SECONDS = 1.5
 LOG_MAX_ENTRIES = 50
 LOG_MAX_FILE_BYTES = 200_000
 
-FRAME_INTERVAL_MS = 30
+FRAME_INTERVAL_MS = 15        # the loop waits for each new camera frame anyway
 CAMERA_INDEX = 0
+CAMERA_FPS = 30
+# Run camera_test.py to find the fastest settings for your webcam.
+CAMERA_BACKEND = "msmf"       # "dshow", "msmf" or "any" (msmf: ~30 fps on this webcam vs ~8 with dshow)
+CAMERA_MJPG = True            # MJPG mode lets many webcams reach full frame rate
+CAMERA_EXPOSURE = None        # None = automatic; a number like -6 = fixed exposure (faster in dim light, darker image)
 
 DEFAULT_MAPPING = {
     "fist": "double_click",

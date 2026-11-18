@@ -59,6 +59,73 @@ def cursor_position(hand, sensitivity, screen_w, screen_h):
 
 # ---------- Smoothing ----------
 
+class OneEuroFilter:
+    """Smooths a noisy value: strong smoothing when it changes slowly (removes shake),
+    light smoothing when it changes fast (stays responsive).
+    Casiez, Roussel & Vogel, "1 Euro Filter", CHI 2012."""
+
+    def __init__(self, min_cutoff, beta, d_cutoff=1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.value = None
+        self.speed = 0.0
+        self.time = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1 / (2 * math.pi * cutoff)
+        return 1 / (1 + tau / dt)
+
+    def __call__(self, value, t):
+        if self.value is None:
+            self.value, self.time = value, t
+            return value
+        dt = max(t - self.time, 1e-3)
+        raw_speed = (value - self.value) / dt
+        self.speed += self._alpha(self.d_cutoff, dt) * (raw_speed - self.speed)
+        cutoff = self.min_cutoff + self.beta * abs(self.speed)
+        self.value += self._alpha(cutoff, dt) * (value - self.value)
+        self.time = t
+        return self.value
+
+
+class CursorSmoother:
+    """Removes hand shake from the cursor. A One Euro filter smooths the position, and a
+    hold zone keeps a resting cursor perfectly still until the hand clearly moves."""
+
+    def __init__(self, steadiness=cfg.CURSOR_STEADINESS):
+        self.filters = [OneEuroFilter(cfg.CURSOR_MIN_CUTOFF, cfg.CURSOR_BETA) for _ in range(2)]
+        self.set_steadiness(steadiness)
+        self.reset()
+
+    def set_steadiness(self, value):
+        self.hold_radius = remap_range(value, 0, 100, *cfg.CURSOR_HOLD_RADIUS)
+
+    def reset(self):
+        for f in self.filters:
+            f.reset()
+        self.position = None
+        self.moving = False
+        self.slow_frames = 0
+
+    def update(self, x, y, t):
+        """Raw target pixel in -> pixel to move the cursor to, or None to leave it where it is."""
+        smoothed = tuple(f(v, t) for f, v in zip(self.filters, (x, y)))
+        if self.position is not None:
+            if self.moving:
+                speed = math.hypot(self.filters[0].speed, self.filters[1].speed)
+                self.slow_frames = self.slow_frames + 1 if speed < cfg.CURSOR_STILL_SPEED else 0
+                self.moving = self.slow_frames < 3
+            elif math.dist(smoothed, self.position) > self.hold_radius:
+                self.moving, self.slow_frames = True, 0
+            else:
+                return None
+        self.position = smoothed
+        return round(smoothed[0]), round(smoothed[1])
+
+
 class HandState:
     """Recent predictions for one hand, plus which one-shot gesture is still being held."""
 

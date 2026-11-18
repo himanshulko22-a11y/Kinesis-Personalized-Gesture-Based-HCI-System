@@ -67,6 +67,7 @@ class GestureMappingRow(QWidget):
 
         more = button("+", lambda: on_record_more(gesture), f"Record more samples for '{gesture}'")
         more.setFixedWidth(34)
+        more.setStyleSheet("padding: 0px; font-size: 16px;")   # default padding hid the "+"
         layout.addWidget(more)
 
         delete = button("Delete", lambda: on_delete(gesture), name="deleteBtn")

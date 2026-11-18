@@ -12,7 +12,7 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 
 - **Custom gestures:** record any gesture you like and train the model in a few clicks. No pre-built gesture set is forced on you.
 - **Gesture-to-action mapping:** choose what each gesture does from the app's mapping list.
-- **Cursor control:** point with your hand to move the mouse, with an adjustable sensitivity slider. The cursor follows the base of the middle finger (landmark 9), which shakes less than the wrist or a fingertip.
+- **Cursor control:** point with your hand to move the mouse, with an adjustable sensitivity slider. The cursor follows the base of the middle finger (landmark 9), which shakes less than the wrist or a fingertip, and is smoothed with a One Euro filter plus a hold zone, so it stays still when your hand rests and keeps up when you move fast. A **Cursor Steadiness** slider adjusts the hold zone.
 - **Two-hand zoom:** move both hands apart or together to zoom in and out (can be turned on or off).
 - **Idle lock and unlock:** the app locks itself when no hand is seen for a while, and you unlock it by holding a chosen gesture (or with a button).
 - **Confidence threshold:** set how sure the model must be before an action fires.
@@ -76,6 +76,7 @@ No trained model is included, so you start by teaching the app your gestures:
 | `gestures.py` | Landmarks, smoothing, dataset, model training, gesture-to-action mapping |
 | `actions.py` | What each action does (click, volume, scroll...) |
 | `widgets.py` | Small UI pieces: buttons, mapping row, confusion matrix |
+| `camera.py` | Reads the webcam in a background thread so the app always gets the newest frame |
 | `config.py` | All settings and file paths |
 | `style.py` | Window theme |
 
