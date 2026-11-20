@@ -17,6 +17,37 @@ def section_title(text):
     return label
 
 
+class CollapsibleSection(QWidget):
+    """A section title you can click to show or hide what's under it."""
+
+    def __init__(self, title, expanded=True, on_toggle=None, danger=False):
+        super().__init__()
+        self.title, self.on_toggle = title, on_toggle
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.header = QPushButton()
+        self.header.setObjectName("dangerHeader" if danger else "sectionHeader")
+        self.header.setCursor(Qt.PointingHandCursor)
+        self.header.clicked.connect(self.toggle)
+        self.body = QWidget()
+        self.content = QVBoxLayout(self.body)
+        self.content.setContentsMargins(6, 2, 0, 8)
+        layout.addWidget(self.header)
+        layout.addWidget(self.body)
+        self.set_expanded(expanded)
+
+    def set_expanded(self, expanded):
+        self.expanded = expanded
+        self.body.setVisible(expanded)
+        self.header.setText(("▾   " if expanded else "▸   ") + self.title)
+
+    def toggle(self):
+        self.set_expanded(not self.expanded)
+        if self.on_toggle:
+            self.on_toggle(self.title, self.expanded)
+
+
 def note(text):
     label = QLabel(text)
     label.setObjectName("note")
@@ -49,7 +80,7 @@ def ask(parent, title, text):
 # ---------- Dialog / row widgets ----------
 
 class GestureMappingRow(QWidget):
-    def __init__(self, gesture, action, on_change, on_record_more, on_delete):
+    def __init__(self, gesture, action, on_change, on_record_more, on_delete, on_rename=None, movement=False):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 4)
@@ -60,15 +91,23 @@ class GestureMappingRow(QWidget):
 
         self.combo = QComboBox()
         for key, info in ACTIONS.items():
+            if movement and info.kind in ("cursor", "hold", "hold_move"):
+                continue   # a movement is over in a moment, so it can't steer the cursor or hold a button
             self.combo.addItem(info.label, userData=key)
         self.combo.setCurrentIndex(max(0, self.combo.findData(action)))
         self.combo.currentIndexChanged.connect(lambda: on_change(gesture, self.combo.currentData()))
         layout.addWidget(self.combo)
 
-        more = button("+", lambda: on_record_more(gesture), f"Record more samples for '{gesture}'")
+        more = button("+", lambda: on_record_more(gesture),
+                      f"Record another '{gesture}' movement" if movement else f"Record more samples for '{gesture}'")
         more.setFixedWidth(34)
         more.setStyleSheet("padding: 0px; font-size: 16px;")   # default padding hid the "+"
         layout.addWidget(more)
+
+        if on_rename is not None:
+            rename = button("Rename", lambda: on_rename(gesture), f"Give '{gesture}' a new name")
+            rename.setFixedWidth(85)
+            layout.addWidget(rename)
 
         delete = button("Delete", lambda: on_delete(gesture), name="deleteBtn")
         delete.setFixedWidth(85)

@@ -3,6 +3,7 @@ gesture_data.csv
 gesture_model.keras
 label_encoder.pkl
 gesture_mapping.json
+movement_data.json
 activity_log.txt*
 screenshots/
 screenshot_*.png

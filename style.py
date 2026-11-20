@@ -101,6 +101,24 @@ QSlider::handle:horizontal {
     margin: -5px 0;
     border-radius: 7px;
 }
+QPushButton#sectionHeader, QPushButton#dangerHeader {
+    background-color: transparent;
+    color: #c9a8ff;
+    font-size: 15px;
+    font-weight: bold;
+    text-align: left;
+    padding: 9px 4px;
+    margin-top: 4px;
+    border: none;
+    border-bottom: 1px solid #2e2450;
+    border-radius: 0px;
+}
+QPushButton#dangerHeader {
+    color: #ff9eb0;
+}
+QPushButton#sectionHeader:hover, QPushButton#dangerHeader:hover {
+    background-color: #1f1735;
+}
 QLabel#note {
     color: #9d8ec2;
     font-size: 11px;

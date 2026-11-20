@@ -96,13 +96,10 @@ class CursorSmoother:
     """Removes hand shake from the cursor. A One Euro filter smooths the position, and a
     hold zone keeps a resting cursor perfectly still until the hand clearly moves."""
 
-    def __init__(self, steadiness=cfg.CURSOR_STEADINESS):
+    def __init__(self):
         self.filters = [OneEuroFilter(cfg.CURSOR_MIN_CUTOFF, cfg.CURSOR_BETA) for _ in range(2)]
-        self.set_steadiness(steadiness)
+        self.hold_radius = cfg.CURSOR_HOLD_RADIUS
         self.reset()
-
-    def set_steadiness(self, value):
-        self.hold_radius = remap_range(value, 0, 100, *cfg.CURSOR_HOLD_RADIUS)
 
     def reset(self):
         for f in self.filters:
@@ -149,6 +146,14 @@ class HandState:
             self.frames_released = 0 if gesture == self.latched else self.frames_released + 1
             if self.frames_released >= cfg.RELEASE_FRAMES:
                 self.latched = None
+
+    def majority(self, count):
+        """The gesture seen in at least `count` of the recent frames (a looser check), else None."""
+        seen = [g for g in self.recent if g is not None]
+        if not seen:
+            return None
+        best = max(set(seen), key=seen.count)
+        return best if seen.count(best) >= count else None
 
     def stable(self):
         """The gesture if every recent frame agrees on it, else None."""
@@ -291,6 +296,20 @@ def train_model(augment=True):
     with open(cfg.ENCODER_PATH, "wb") as f:
         pickle.dump(encoder, f)
     return model, encoder, accuracy, raw_rows, len(X_train)
+
+
+def save_encoder(encoder):
+    with open(cfg.ENCODER_PATH, "wb") as f:
+        pickle.dump(encoder, f)
+
+
+def rename_label(encoder, old, new):
+    """Renames a pose inside the trained model's label list, keeping its position,
+    so the model doesn't need retraining."""
+    classes = np.asarray(encoder.classes_, dtype=object)   # object: a longer name isn't cut off
+    classes[classes == old] = new
+    encoder.classes_ = classes
+    save_encoder(encoder)
 
 
 def predict(model, encoder, hand):

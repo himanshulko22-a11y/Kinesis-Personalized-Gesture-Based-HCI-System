@@ -11,7 +11,7 @@ from camera import open_camera
 
 SETTINGS = [
     # (name, backend, mjpg, exposure)
-    ("DirectShow + MJPG (current)", "dshow", True, None),
+    ("DirectShow + MJPG", "dshow", True, None),
     ("DirectShow, default format", "dshow", False, None),
     ("Media Foundation", "msmf", False, None),
     ("Media Foundation + MJPG", "msmf", True, None),

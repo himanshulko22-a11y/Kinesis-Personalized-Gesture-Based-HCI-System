@@ -12,20 +12,22 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 
 - **Custom gestures:** record any gesture you like and train the model in a few clicks. No pre-built gesture set is forced on you.
 - **Gesture-to-action mapping:** choose what each gesture does from the app's mapping list.
-- **Cursor control:** point with your hand to move the mouse, with an adjustable sensitivity slider. The cursor follows the base of the middle finger (landmark 9), which shakes less than the wrist or a fingertip, and is smoothed with a One Euro filter plus a hold zone, so it stays still when your hand rests and keeps up when you move fast. A **Cursor Steadiness** slider adjusts the hold zone.
+- **Cursor control:** point with your hand to move the mouse, with an adjustable sensitivity slider. The cursor follows the base of the middle finger (landmark 9), which shakes less than the wrist or a fingertip, and is smoothed with a One Euro filter plus a hold zone, so it stays still when your hand rests and keeps up when you move fast. The hold zone size can be changed with `CURSOR_HOLD_RADIUS` in `config.py`.
 - **Two-hand zoom:** move both hands apart or together to zoom in and out (can be turned on or off).
 - **Idle lock and unlock:** the app locks itself when no hand is seen for a while, and you unlock it by holding a chosen gesture (or with a button).
 - **Confidence threshold:** set how sure the model must be before an action fires.
 - **Built-in model tools:** dataset info, dataset balancing, optional data augmentation, a self-test for accuracy, and a confusion matrix.
+- **Movements (dynamic gestures):** record your own movements, such as swipes, circles, a wave, push/pull, a tick or a cross, made with an open hand (4+ fingers stretched out, checked from the hand's shape). Kinesis cuts each movement out of the video by hand speed and recognises it with **DTW (Dynamic Time Warping) + nearest neighbour**, so the same movement matches whether it was fast or slow, big or small. New movements work straight away, with no retraining. Unknown movements are ignored rather than guessed: a movement must start from a still hand, be clearly closer to one movement than to any other, and the hand coming back after a swipe is ignored. A **movement trail** on the video shows the path while you move and what it was recognised as.
 - **Similar-gesture warning:** right after you record a gesture, Kinesis compares its hand shape with your other gestures and warns you if they're too alike, before you train.
 - **Learning from mistakes:** if a gesture fires by accident, mark it within 5 seconds (button, the mistake hotkey - **Z** by default, changeable in the app - or a gesture mapped to *Mark Last Action as Mistake*). That hand shape is saved as "not a gesture", and the model learns not to fire on it at the next retrain.
 - **Speed readout:** camera FPS, app FPS and time per step, shown on the video.
-- **Activity log:** see what the app did and when.
+- **Activity log:** see what the app did and when, including why a movement was ignored.
+- **Collapsible panel:** every section of the side panel can be opened or closed (or all at once), and the app remembers your choice.
 - **Safety options:** pause recognition at any time, reset all data, and save or restore a default setup. Gestures never fire while a dialog is open.
 
 ## Available actions
 
-Left click, right click, double click, move cursor, volume up/down, scroll up/down, switch window (next/previous), take screenshot, mark last action as mistake, or none. Ready-made shortcuts: media play/pause, next/previous track, mute, next/previous slide, show desktop, task view, copy, paste, undo, Enter and Escape. You can also add **any keyboard shortcut** of your own (e.g. Ctrl+S, Win+E, F5) under **Custom Shortcuts**; it is saved in `settings.json`.
+Left click, right click, double click, move cursor, **hold left/right click** and **drag** (button held while the gesture is held, for drag and drop), volume up/down, scroll up/down, switch window (next/previous), take screenshot, mark last action as mistake, or none. Ready-made shortcuts: media play/pause, next/previous track, mute, brightness up/down (laptop screen), next/previous slide, show desktop, task view, copy, paste, undo, Enter and Escape. You can also add **any keyboard shortcut** of your own (e.g. Ctrl+S, Win+E, F5) under **Custom Shortcuts**; it is saved in `settings.json`.
 
 ## How it works
 
@@ -37,7 +39,7 @@ Left click, right click, double click, move cursor, volume up/down, scroll up/do
 
 ## Requirements
 
-- **Windows** (the app uses the DirectShow camera backend and Windows-specific features)
+- **Windows** (the app uses Windows camera backends - Media Foundation or DirectShow - and Windows-only features such as brightness control and the global mistake hotkey)
 - Python 3.11 (TensorFlow 2.15 supports up to 3.11 and pandas 3 needs 3.11 or newer)
 - A webcam
 
@@ -57,7 +59,7 @@ python Kinesis_app.py
 
 ### First-time setup
 
-No trained model is included, so you start by teaching the app your gestures:
+Click **Restore Defaults** (in *Danger Zone*) to load the included default gestures, or teach the app your own:
 
 1. Click **Record Gesture**, type a name (for example `fist` or `thumbs_up`), and hold that gesture in front of the camera until recording finishes.
 2. Record at least two different gestures.
@@ -79,7 +81,8 @@ No trained model is included, so you start by teaching the app your gestures:
 | `gestures.py` | Landmarks, smoothing, dataset, model training, gesture-to-action mapping |
 | `actions.py` | What each action does (click, volume, scroll...) |
 | `widgets.py` | Small UI pieces: buttons, mapping row, confusion matrix |
-| `camera.py` | Reads the webcam in a background thread so the app always gets the newest frame |
+| `camera.py` | Opens and reads the webcam, picks the fastest working camera mode, and switches mode if the picture turns black |
+| `movements.py` | Movements: detecting start/end, DTW matching, storage |
 | `config.py` | All settings and file paths |
 | `camera_test.py` | Measures which camera mode is fastest on your webcam |
 | `camera_reset.py` | Switches the webcam back to automatic exposure |
@@ -90,6 +93,8 @@ No trained model is included, so you start by teaching the app your gestures:
 The repository includes a ready-made default setup: **15 static hand poses** (9,000 frames, 600 per pose, recorded with both hands) with a trained model and action mapping. After downloading, click **Restore Defaults** to use it straight away, or record your own gestures instead.
 
 Poses: open_palm, fist, point, pinch, ok_sign, thumbs_up, thumbs_down, peace, three, four, rock, call_me, L_sign, point_down, pinky_up.
+
+It also includes **12 movements**: swipe left/right/up/down, circle clockwise/anticlockwise, wave, push, pull, tick, cross and zigzag. The swipe left/right templates were recorded by hand; the others are built-in default templates. Add a few of your own recordings with **+** to fit them to your hand.
 
 The data contains only MediaPipe hand-landmark coordinates (21 points per frame, relative to the wrist), with no images or video. These are the `*_backup` files; **Save as Default** replaces them with your own setup.
 
@@ -103,9 +108,10 @@ These are made next to `Kinesis_app.py` while you use the app and are not upload
 | `gesture_model.keras` | Your trained model |
 | `label_encoder.pkl` | Gesture name encoder |
 | `gesture_mapping.json` | Your gesture-to-action settings |
+| `movement_data.json` | Your recorded movements |
 | `activity_log.txt` | Activity log |
 | `screenshots/` | Screenshots taken by the screenshot gesture |
-| `settings.json` | Your mistake hotkey and custom shortcuts |
+| `settings.json` | Your mistake hotkey, custom shortcuts, trail on/off and which panel sections are open |
 
 The `*_backup` files (your saved default setup) **are** part of the repository - see *Included default dataset* above.
 
