@@ -22,6 +22,9 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 - **Learning from mistakes:** if a gesture fires by accident, mark it within 5 seconds (button, the mistake hotkey - **Z** by default, changeable in the app - or a gesture mapped to *Mark Last Action as Mistake*). That hand shape is saved as "not a gesture", and the model learns not to fire on it at the next retrain.
 - **Speed readout:** camera FPS, app FPS and time per step, shown on the video.
 - **Activity log:** see what the app did and when, including why a movement was ignored.
+- **Background training:** Retrain runs in a separate thread, so the camera and gestures keep working (with the old model) and the window never freezes; the new model swaps in when it's ready.
+- **Instant delete with undo:** deleting poses or movements (one at a time or several at once) is instant - deleted poses are ignored until you next retrain. Deleted gestures go to a trash file: **Undo** right after, or **Restore Deleted Gestures** later. The trash keeps them for 30 days (then they're removed automatically), or click **Empty Trash** to remove them now.
+- **Faster tracking option:** switch MediaPipe to its lite hand model for a higher frame rate.
 - **Collapsible panel:** every section of the side panel can be opened or closed (or all at once), and the app remembers your choice.
 - **Safety options:** pause recognition at any time, reset all data, and save or restore a default setup. Gestures never fire while a dialog is open.
 
@@ -111,7 +114,8 @@ These are made next to `Kinesis_app.py` while you use the app and are not upload
 | `movement_data.json` | Your recorded movements |
 | `activity_log.txt` | Activity log |
 | `screenshots/` | Screenshots taken by the screenshot gesture |
-| `settings.json` | Your mistake hotkey, custom shortcuts, trail on/off and which panel sections are open |
+| `settings.json` | Your mistake hotkey, custom shortcuts, display options and which panel sections are open |
+| `deleted_gestures.csv`, `deleted_movements.json` | Deleted gestures, kept so they can be restored |
 
 The `*_backup` files (your saved default setup) **are** part of the repository - see *Included default dataset* above.
 

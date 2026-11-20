@@ -14,18 +14,21 @@ Files:
 import os
 import shutil
 import sys
+import threading
 import time
+
+import json
 
 import cv2
 import mediapipe as mp
 import pandas as pd
 import pyautogui
-from PyQt5.QtCore import Qt, QTimer, QUrl
-from PyQt5.QtGui import QDesktopServices, QIcon, QImage, QKeySequence, QPixmap
+from PyQt5.QtCore import QRectF, Qt, QTimer, QUrl
+from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath,
+                         QPalette, QPixmap)
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog, QKeySequenceEdit, QLabel, QLineEdit,
-    QListWidget,
-    QMainWindow, QMessageBox, QScrollArea, QSlider, QVBoxLayout, QWidget,
+    QListView, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
 import config as cfg
@@ -36,7 +39,8 @@ from camera import Camera
 from actions import (ACTIONS, SHORTCUT_PREFIX, add_shortcut, custom_shortcuts, hotkey_pressed, load_settings,
                      parse_hotkey, remove_shortcut, save_settings)
 from style import STYLESHEET
-from widgets import CollapsibleSection, ConfusionMatrixDialog, GestureMappingRow, ask, button, clear_layout, note, section_title
+from widgets import (CollapsibleSection, ConfusionMatrixDialog, GestureMappingRow, HandTile, SelectGesturesDialog,
+                     ask, button, clear_layout, field_label, note)
 
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
@@ -50,13 +54,13 @@ class KinesisApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Kinesis - Personalized Gesture Control")
-        self.setGeometry(80, 40, 1050, 780)
+        self.setGeometry(60, 40, 1320, 820)
+        self.setMinimumSize(1000, 660)
         if os.path.exists(cfg.ICON_PATH):
             self.setWindowIcon(QIcon(cfg.ICON_PATH))
 
         load_error = self._load_model()
 
-        self.hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.7)
         self.camera = Camera()
         self.frame_id = 0
         self.timing = {"app_fps": 0.0, "tracking": 0.0, "gestures": 0.0, "display": 0.0}   # running averages
@@ -72,6 +76,8 @@ class KinesisApp(QMainWindow):
         self.recorded_path = None           # movement captured, waiting for Save / Retake
         self.countdown_end = 0.0
         self.trails = {}                    # hand -> finished movement shown on the video for a moment
+        self.hand_view = {}                 # hand -> what its tile shows this frame (filled by the loop)
+        self.status_pill_text = None
         self.cursor_used = False
         self.held_buttons = {}   # hand -> {"button", "gesture", "label", "kind"} for press-and-hold actions
         self.show_speed = True
@@ -94,6 +100,13 @@ class KinesisApp(QMainWindow):
         self.last_fired = None        # last action that fired, so it can be marked as a mistake
         self.hotkey_down = False
         self.settings = load_settings()
+        self.lite_tracking = self.settings.get("lite_tracking", cfg.LITE_TRACKING)
+        self.hands = self._make_hand_tracker()
+        self.training = None                # background training thread while it runs
+        self.train_progress = 0.0
+        self.train_result = None
+        self.removed_poses = set()          # deleted poses the current model still knows (ignored until retrain)
+        self.last_deleted = None            # what the Undo link would bring back
         for text in self.settings.get("shortcuts", []):
             try:
                 add_shortcut(text)   # before the mapping loads, so gestures can keep these actions
@@ -107,6 +120,10 @@ class KinesisApp(QMainWindow):
             self.mistake_hotkey, self.hotkey_codes = cfg.MISTAKE_HOTKEY, parse_hotkey(cfg.MISTAKE_HOTKEY)
 
         self._build_ui()
+        try:
+            self._clean_trash()   # drop anything deleted more than TRASH_KEEP_DAYS ago
+        except (OSError, ValueError) as e:
+            self._log(f"Trash clean-up skipped: {e}")
         if load_error:
             self.status_label.setText(f"Saved model couldn't be loaded ({load_error}). Retrain or Restore Defaults.")
         elif not self.camera.is_opened():
@@ -135,43 +152,115 @@ class KinesisApp(QMainWindow):
     def _build_ui(self):
         self.sections = {}
         central = QWidget()
+        central.setObjectName("root")
         self.setCentralWidget(central)
         outer = QHBoxLayout(central)
+        outer.setContentsMargins(16, 16, 8, 16)
+        outer.setSpacing(16)
 
+        # Left: the camera, as big as the window allows (it keeps its shape)
         video_frame = QFrame()
         video_frame.setObjectName("videoFrame")
         self.video_label = QLabel()
-        self.video_label.setFixedSize(640, 480)
+        self.video_label.setObjectName("videoLabel")
+        self.video_label.setMinimumSize(480, 360)
+        self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)   # don't grow to the picture
         self.video_label.setAlignment(Qt.AlignCenter)
-        QVBoxLayout(video_frame).addWidget(self.video_label)
-        outer.addWidget(video_frame)
+        video_layout = QVBoxLayout(video_frame)
+        video_layout.setContentsMargins(10, 10, 10, 10)
+        video_layout.addWidget(self.video_label)
+        outer.addWidget(video_frame, 1)
 
+        # Right: the control panel
         panel = QWidget()
+        panel.setObjectName("panel")
+        panel.setAttribute(Qt.WA_StyledBackground, True)
         col = QVBoxLayout(panel)
+        col.setContentsMargins(4, 0, 12, 0)
+        col.setSpacing(10)
         scroll = QScrollArea()
+        scroll.setObjectName("panelScroll")
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(panel)
-        outer.addWidget(scroll)
+        self.panel_scroll = scroll
+        self.panel_layout = col
+        right = QWidget()   # pinned top part (when locked) + the scrolling panel
+        right.setMinimumWidth(500)
+        right.setMaximumWidth(620)
+        self.right_layout = QVBoxLayout(right)
+        self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_layout.setSpacing(10)
+        self.right_layout.addWidget(scroll, 1)
+        outer.addWidget(right)
 
+        # Top part: title, live card, pause/unlock. Pinned (doesn't scroll) unless the lock is opened.
+        self.top_block = QWidget()
+        top = QVBoxLayout(self.top_block)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+
+        header = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
         title = QLabel("KINESIS")
         title.setObjectName("appTitle")
-        col.addWidget(title)
-        self.gesture_label = QLabel("Gesture: none")
+        font = title.font()
+        font.setLetterSpacing(QFont.AbsoluteSpacing, 4)
+        title.setFont(font)
+        tagline = QLabel("Personalized gesture control")
+        tagline.setObjectName("tagline")
+        titles.addWidget(title)
+        titles.addWidget(tagline)
+        header.addLayout(titles)
+        header.addStretch()
+        self.pin_btn = QPushButton()
+        self.pin_btn.setObjectName("pinBtn")
+        self.pin_btn.setCursor(Qt.PointingHandCursor)
+        self.pin_btn.setFixedSize(34, 30)
+        self.pin_btn.clicked.connect(lambda: self._set_top_pinned(not self.top_pinned))
+        header.addWidget(self.pin_btn, 0, Qt.AlignVCenter)
+        self.status_pill = QLabel("")
+        self.status_pill.setObjectName("statusPill")
+        header.addWidget(self.status_pill, 0, Qt.AlignVCenter)
+        top.addLayout(header)
+
+        # Live card: one tile per hand, then the overall state and the last action
+        live = QFrame()
+        live.setObjectName("liveCard")
+        live_layout = QVBoxLayout(live)
+        live_layout.setContentsMargins(14, 12, 14, 12)
+        live_layout.setSpacing(8)
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        self.hand_tiles = {"Left": HandTile("Left"), "Right": HandTile("Right")}
+        for tile in self.hand_tiles.values():
+            tiles.addWidget(tile)
+        live_layout.addLayout(tiles)
+        self.gesture_label = QLabel("No hand in view")
         self.gesture_label.setObjectName("gestureLabel")
-        self.confidence_label = QLabel("Confidence: -")
+        self.confidence_label = QLabel("")
         self.confidence_label.setObjectName("confidenceLabel")
         self.last_action_label = QLabel("Last action: -")
         self.last_action_label.setObjectName("lastActionLabel")
-        for label in (self.gesture_label, self.confidence_label, self.last_action_label):
-            col.addWidget(label)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Unlock gesture:"))
-        self.unlock_combo = QComboBox()
-        self.unlock_combo.currentIndexChanged.connect(
-            lambda: setattr(self, "unlock_gesture", self.unlock_combo.currentData()))
-        row.addWidget(self.unlock_combo)
-        col.addLayout(row)
+        self.last_action_label.setWordWrap(True)
+        state_row = QHBoxLayout()
+        state_row.addWidget(self.gesture_label)
+        state_row.addStretch()
+        state_row.addWidget(self.confidence_label)
+        live_layout.addLayout(state_row)
+        live_layout.addWidget(self.last_action_label)
+        self.status_label = QLabel("")   # general messages: lock, training, camera problems...
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setWordWrap(True)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, 1)
+        self.undo_btn = button("Undo", self.undo_delete, "Bring back what was just deleted", name="linkBtn")
+        self.undo_btn.setCursor(Qt.PointingHandCursor)
+        self.undo_btn.hide()
+        status_row.addWidget(self.undo_btn, 0, Qt.AlignTop)
+        live_layout.addLayout(status_row)
+        top.addWidget(live)
 
         row = QHBoxLayout()
         self.pause_btn = button("Pause Recognition", self.toggle_pause,
@@ -179,34 +268,41 @@ class KinesisApp(QMainWindow):
         row.addWidget(self.pause_btn)
         row.addWidget(button("Manual Unlock", lambda: self._unlock("manual button"),
                              f"The app locks after {cfg.IDLE_LOCK_TIMEOUT}s with no hand. Unlock here, "
-                             f"or hold the unlock gesture for {cfg.UNLOCK_HOLD_SECONDS}s."))
-        col.addLayout(row)
-
-        # Recording status and Save/Retake/Cancel sit up here (not inside a section) so they're
-        # visible even when recording is started from a + button with "Add New Gesture" collapsed.
+                             f"or hold the unlock gesture for {cfg.UNLOCK_HOLD_SECONDS}s.", name="secondaryBtn"))
+        top.addLayout(row)
         row = QHBoxLayout()
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        self.save_btn = button("Save Gesture", self.save_recording)
-        self.retake_btn = button("Retake", lambda: self._begin_recording(self.new_gesture_name))
-        self.cancel_btn = button("Cancel", self.cancel_recording, name="deleteBtn")
-        for widget in (self.status_label, self.save_btn, self.retake_btn, self.cancel_btn):
-            row.addWidget(widget)
-        col.addLayout(row)
-        self.warning_label = QLabel("")
-        self.warning_label.setWordWrap(True)
-        self.warning_label.hide()
-        col.addWidget(self.warning_label)
+        row.addWidget(field_label("Unlock gesture"))
+        self.unlock_combo = QComboBox()
+        self.unlock_combo.currentIndexChanged.connect(
+            lambda: setattr(self, "unlock_gesture", self.unlock_combo.currentData()))
+        row.addWidget(self.unlock_combo, 1)
+        top.addLayout(row)
+        self.top_pinned = None
+        self._set_top_pinned(self.settings.get("pin_top", True), save=False)
 
         row = QHBoxLayout()
-        row.addWidget(button("Expand All", lambda: self._expand_all(True)))
-        row.addWidget(button("Collapse All", lambda: self._expand_all(False)))
+        row.addStretch()
+        for text, opened in (("Expand all", True), ("Collapse all", False)):
+            link = button(text, lambda opened=opened: self._expand_all(opened), name="linkBtn")
+            link.setCursor(Qt.PointingHandCursor)
+            row.addWidget(link)
         col.addLayout(row)
 
         box = self._section(col, "Gesture Mapping", True)
         self.mapping_layout = QVBoxLayout()
         self.mapping_layout.setAlignment(Qt.AlignTop)
         box.addLayout(self.mapping_layout)
+        self.pending_label = QLabel("")
+        self.pending_label.setObjectName("pendingLabel")
+        self.pending_label.setWordWrap(True)
+        self.pending_label.hide()
+        box.addWidget(self.pending_label)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(button("Delete Several...", self.delete_several,
+                             "Tick several gestures and delete them together. Deleting is instant - "
+                             "retrain whenever it suits you.", name="deleteBtn"))
+        box.addLayout(row)
 
         box = self._section(col, "Add New Gesture", True)
         row = QHBoxLayout()
@@ -235,7 +331,23 @@ class KinesisApp(QMainWindow):
         box.addLayout(row)
         box.addWidget(button("Self-Test Accuracy", self.run_self_test,
                              "Tests the model on a random slice of your data. Some of it was used in "
-                             "training, so treat it as a sanity check - live testing is the real test."))
+                             "training, so treat it as a sanity check - live testing is the real test.",
+                             name="secondaryBtn"))
+        self.record_label = QLabel("")   # recording progress and results
+        self.record_label.setObjectName("statusLabel")
+        self.record_label.setWordWrap(True)
+        box.addWidget(self.record_label)
+        self.warning_label = QLabel("")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.hide()
+        box.addWidget(self.warning_label)
+        row = QHBoxLayout()
+        self.save_btn = button("Save Gesture", self.save_recording)
+        self.retake_btn = button("Retake", lambda: self._begin_recording(self.new_gesture_name), name="secondaryBtn")
+        self.cancel_btn = button("Cancel", self.cancel_recording, name="deleteBtn")
+        for widget in (self.save_btn, self.retake_btn, self.cancel_btn):
+            row.addWidget(widget)
+        box.addLayout(row)
 
         box = self._section(col, "Sensitivity", False)
         self._add_slider(box, "Confidence Threshold", 50, 95, int(self.confidence_threshold * 100),
@@ -279,6 +391,13 @@ class KinesisApp(QMainWindow):
         trail_box.setChecked(self.show_trail)
         trail_box.stateChanged.connect(self.on_trail_toggled)
         box.addWidget(trail_box)
+        lite_box = QCheckBox("Faster hand tracking (lite model)")
+        lite_box.setToolTip("Uses MediaPipe's lighter hand model: less time per frame, so a higher FPS.\n"
+                            "Landmarks come out slightly different from your recordings, so check your "
+                            "gestures still work (re-record any that don't).")
+        lite_box.setChecked(self.lite_tracking)
+        lite_box.stateChanged.connect(self.on_lite_toggled)
+        box.addWidget(lite_box)
         box.addWidget(button("Open Screenshots Folder", self.open_screenshots_folder))
 
         box = self._section(col, "Learning From Mistakes", False)
@@ -310,7 +429,10 @@ class KinesisApp(QMainWindow):
 
         box = self._section(col, "Activity Log", False)
         self.log_widget = QListWidget()
-        self.log_widget.setFixedHeight(140)
+        self.log_widget.setFixedHeight(200)
+        self.log_widget.setWordWrap(True)                     # long entries wrap onto more lines...
+        self.log_widget.setResizeMode(QListView.Adjust)       # ...and re-wrap when the panel is resized
+        self.log_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         box.addWidget(self.log_widget)
         box.addWidget(button("Clear Log", self.log_widget.clear))
 
@@ -322,6 +444,13 @@ class KinesisApp(QMainWindow):
         self.restore_btn = button("Restore Defaults", self.restore_defaults,
                                   "Replaces your current data with the saved default backup.")
         row.addWidget(self.restore_btn)
+        box.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(button("Restore Deleted Gestures...", self.restore_deleted,
+                             f"Bring back poses or movements you deleted (kept for {cfg.TRASH_KEEP_DAYS} days).",
+                             name="secondaryBtn"))
+        row.addWidget(button("Empty Trash", self.empty_trash,
+                             "Permanently delete everything in the trash now.", name="deleteBtn"))
         box.addLayout(row)
         col.addStretch()
 
@@ -337,6 +466,27 @@ class KinesisApp(QMainWindow):
         self.sections[title] = section
         return section.content
 
+    def _set_top_pinned(self, pinned, save=True):
+        """Locked: the top part stays in place while the sections scroll under it.
+        Unlocked: it scrolls away with everything else."""
+        if pinned == self.top_pinned:
+            return
+        self.top_pinned = pinned
+        if pinned:
+            self.panel_layout.removeWidget(self.top_block)
+            self.top_block.setContentsMargins(4, 0, 22, 0)   # line up with the panel beside its scrollbar
+            self.right_layout.insertWidget(0, self.top_block)
+        else:
+            self.right_layout.removeWidget(self.top_block)
+            self.top_block.setContentsMargins(0, 0, 0, 0)
+            self.panel_layout.insertWidget(0, self.top_block)
+        self.pin_btn.setText("🔒" if pinned else "🔓")
+        self.pin_btn.setToolTip("Top part is fixed - click to let it scroll" if pinned
+                                else "Top part scrolls - click to fix it in place")
+        if save:
+            self.settings["pin_top"] = pinned
+            save_settings(self.settings)
+
     def _on_section_toggled(self, title, opened):
         self.settings.setdefault("sections", {})[title] = opened
         save_settings(self.settings)
@@ -348,7 +498,7 @@ class KinesisApp(QMainWindow):
         save_settings(self.settings)
 
     def _add_slider(self, layout, title, low, high, value, fmt, on_change, tooltip=None):
-        layout.addWidget(section_title(title))
+        layout.addWidget(field_label(title))
         row = QHBoxLayout()
         slider = QSlider(Qt.Horizontal)
         slider.setRange(low, high)
@@ -366,7 +516,21 @@ class KinesisApp(QMainWindow):
         poses = list(self.encoder.classes_) if self.encoder is not None else []
         return poses + [m for m in self.movements.labels() if m not in poses]
 
+    def _update_removed_poses(self):
+        """Poses the model still knows but whose data was deleted: ignored until the next Retrain."""
+        df = g.read_dataset()
+        recorded = set(df["label"]) if df is not None else set()
+        trained = set(self.encoder.classes_) if self.encoder is not None else set()
+        self.removed_poses = trained - recorded - {g.NONE_LABEL}
+        if self.removed_poses:
+            self.pending_label.setText(f"{len(self.removed_poses)} deleted pose(s) are ignored for now - "
+                                       "click Retrain Model when convenient to remove them from the model.")
+            self.pending_label.show()
+        else:
+            self.pending_label.hide()
+
     def _refresh_after_model_change(self):
+        self._update_removed_poses()
         self.gesture_mapping = g.load_mapping(self._known_gestures())
         self._clear_prediction_state()
         self.last_action_time = {}
@@ -422,32 +586,40 @@ class KinesisApp(QMainWindow):
 
     def _refresh_mapping_rows(self):
         clear_layout(self.mapping_layout)
-        poses = [p for p in (self.encoder.classes_ if self.encoder is not None else []) if p != g.NONE_LABEL]
+        poses = [p for p in (self.encoder.classes_ if self.encoder is not None else [])
+                 if p != g.NONE_LABEL and p not in self.removed_poses]
         moves = self.movements.labels()
         if not poses and not moves:
             self.mapping_layout.addWidget(QLabel("No gestures trained yet."))
             return
+        if poses:
+            self.mapping_layout.addWidget(self._group_label(f"STATIC POSES  ·  {len(poses)}"))
         for gesture in poses:
             self.mapping_layout.addWidget(GestureMappingRow(
                 gesture, self.gesture_mapping.get(gesture, "none"),
                 self.on_mapping_changed, lambda name: self._begin_recording(name, "pose"), self.delete_gesture,
                 on_rename=self.rename_gesture))
         if moves:
-            header = QLabel("Movements (with an open hand)" if cfg.MOVEMENT_NEEDS_OPEN_HAND else "Movements")
-            header.setStyleSheet("color: #c9a8ff; font-weight: bold; margin-top: 6px;")
-            self.mapping_layout.addWidget(header)
+            self.mapping_layout.addWidget(self._group_label(
+                f"MOVEMENTS  ·  {len(moves)}" + ("  ·  open hand" if cfg.MOVEMENT_NEEDS_OPEN_HAND else "")))
         for name in moves:
             self.mapping_layout.addWidget(GestureMappingRow(
                 name, self.gesture_mapping.get(name, "none"), self.on_mapping_changed,
                 lambda n: self._begin_recording(n, "movement"), self.delete_movement,
                 on_rename=lambda n: self.rename_gesture(n, movement=True), movement=True))
 
+    @staticmethod
+    def _group_label(text):
+        label = QLabel(text)
+        label.setObjectName("groupLabel")
+        return label
+
     def _refresh_unlock_options(self):
         combo = self.unlock_combo
         combo.blockSignals(True)
         combo.clear()
         for gesture in (self.encoder.classes_ if self.encoder is not None else []):
-            if gesture != g.NONE_LABEL:
+            if gesture != g.NONE_LABEL and gesture not in self.removed_poses:
                 combo.addItem(gesture, userData=gesture)
         if combo.count() == 0:
             combo.addItem("(no gestures trained)", userData=None)
@@ -513,7 +685,7 @@ class KinesisApp(QMainWindow):
         self._clear_prediction_state()
         self.unlock_hold_start = None
         self.gesture_label.setText("Locked")
-        self.confidence_label.setText("Confidence: -")
+        self.confidence_label.setText("")
         self.status_label.setText(self._lock_message())
         self._log(f"Auto-lock (idle {cfg.IDLE_LOCK_TIMEOUT}s)")
 
@@ -530,7 +702,9 @@ class KinesisApp(QMainWindow):
     # ---------- Logging ----------
 
     def _log(self, message):
-        self.log_widget.insertItem(0, f"[{time.strftime('%H:%M:%S')}] {message}")
+        entry = QListWidgetItem(f"[{time.strftime('%H:%M:%S')}] {message}")
+        entry.setToolTip(entry.text())   # hover shows the full entry too
+        self.log_widget.insertItem(0, entry)
         while self.log_widget.count() > cfg.LOG_MAX_ENTRIES:
             self.log_widget.takeItem(self.log_widget.count() - 1)
         try:
@@ -540,16 +714,6 @@ class KinesisApp(QMainWindow):
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
         except OSError as e:
             print(f"Activity log write failed: {e}")
-
-    def _show_video_message(self, message):
-        """Replaces the video with a message. The camera timer is paused first, otherwise it
-        draws one more frame over the message, which then stays frozen while the app is busy."""
-        self.timer.stop()
-        self.video_label.clear()
-        self.video_label.setText(message)
-        self.video_label.setStyleSheet("color: #c9a8ff; font-size: 22px; font-weight: bold;")
-        self.video_label.repaint()
-        QApplication.processEvents()
 
     def open_screenshots_folder(self):
         os.makedirs(cfg.SCREENSHOT_DIR, exist_ok=True)
@@ -608,6 +772,8 @@ class KinesisApp(QMainWindow):
         return None
 
     def rename_gesture(self, old, movement=False):
+        if not movement and self._busy_training():
+            return
         new, ok = QInputDialog.getText(self, "Rename gesture", f"New name for '{old}':", text=old)
         new = new.strip()
         if not ok or new == old:
@@ -649,12 +815,16 @@ class KinesisApp(QMainWindow):
         self.mode = "recording"
         self._set_recording_buttons()
         self.warning_label.hide()
+        section = self.sections.get("Add New Gesture")
+        if section is not None:   # recording may start from a + button with the section closed
+            section.set_expanded(True)
+            self.panel_scroll.ensureWidgetVisible(section)
         if kind == "movement":
             self.record_tracker.reset()
             self.countdown_end = time.time() + cfg.MOVE_COUNTDOWN
-            self.status_label.setText(f"Movement '{name}': get your open palm ready...")
+            self.record_label.setText(f"Movement '{name}': get your open palm ready...")
         else:
-            self.status_label.setText(f"Recording '{name}'... hold your gesture with one hand.")
+            self.record_label.setText(f"Recording '{name}'... hold your gesture with one hand.")
 
     def _record_movement_frame(self, hands, now, frame):
         if now < self.countdown_end:
@@ -671,7 +841,7 @@ class KinesisApp(QMainWindow):
                     self._log(f"Movement recording '{self.new_gesture_name}': not used - {tracker.last_problem}")
                     tracker.last_movement = None
                 tracker.reset()
-                self.status_label.setText("Show ONE hand for the movement." if hands else
+                self.record_label.setText("Show ONE hand for the movement." if hands else
                                           f"Movement '{self.new_gesture_name}': show your hand, then move.")
                 return
         else:
@@ -683,15 +853,15 @@ class KinesisApp(QMainWindow):
                 self._log(f"Movement recording '{self.new_gesture_name}': started (speed {tracker.speed:.1f})")
             if movement is None and tracker.last_movement is not None:
                 self._log(f"Movement recording '{self.new_gesture_name}': not used - {tracker.last_problem}")
-                self.status_label.setText(f"That movement was {tracker.last_problem} - try again, a bit bigger.")
+                self.record_label.setText(f"That movement was {tracker.last_problem} - try again, a bit bigger.")
                 tracker.last_movement = None
                 return
         if self.record_tracker.active:
             self._draw_path(frame, self.record_tracker.capture, (255, 200, 120))
-            self.status_label.setText(f"Recording '{self.new_gesture_name}'... stop moving to finish.")
+            self.record_label.setText(f"Recording '{self.new_gesture_name}'... stop moving to finish.")
         elif movement is None:
             waited = now - self.countdown_end
-            self.status_label.setText(
+            self.record_label.setText(
                 f"Movement '{self.new_gesture_name}': GO - make the movement, then hold still."
                 if waited < cfg.MOVE_RECORD_TIMEOUT else
                 "No movement detected yet - move a bit faster, or press Retake / Cancel.")
@@ -701,7 +871,7 @@ class KinesisApp(QMainWindow):
             self.mode = "reviewing"
             self._set_recording_buttons()
             seconds = movement[-1][3] - movement[0][3]
-            self.status_label.setText(f"Captured '{self.new_gesture_name}' ({seconds:.1f} s). "
+            self.record_label.setText(f"Captured '{self.new_gesture_name}' ({seconds:.1f} s). "
                                       f"Save Gesture to keep it, or Retake.")
             self._show_movement_warning()
 
@@ -720,14 +890,14 @@ class KinesisApp(QMainWindow):
     def _record_frame(self, hands):
         if len(hands) == 1:
             self.recording_buffer.append(g.normalize_landmarks(hands[0][1]))
-            self.status_label.setText(
+            self.record_label.setText(
                 f"Recording '{self.new_gesture_name}': {len(self.recording_buffer)}/{cfg.FRAMES_PER_RECORDING}")
         elif len(hands) > 1:
-            self.status_label.setText("Show only ONE hand while recording.")
+            self.record_label.setText("Show only ONE hand while recording.")
         if len(self.recording_buffer) >= cfg.FRAMES_PER_RECORDING:
             self.mode = "reviewing"
             self._set_recording_buttons()
-            self.status_label.setText(
+            self.record_label.setText(
                 f"Captured {len(self.recording_buffer)} frames for '{self.new_gesture_name}'. "
                 f"Save Gesture to keep it, or Retake.")
             self._show_similarity_warning()
@@ -752,6 +922,8 @@ class KinesisApp(QMainWindow):
         if self.record_kind == "movement":
             self._save_movement()
             return
+        if self._busy_training():
+            return   # the recording stays waiting for Save
         g.append_recording(self.new_gesture_name, self.recording_buffer)
         count = len(self.recording_buffer)
         self.recording_buffer = []
@@ -759,7 +931,7 @@ class KinesisApp(QMainWindow):
         self._set_recording_buttons()
         self.warning_label.hide()
         self._refresh_dataset_info()
-        self.status_label.setText(f"Saved {count} frames for '{self.new_gesture_name}'. "
+        self.record_label.setText(f"Saved {count} frames for '{self.new_gesture_name}'. "
                                   f"Record more takes for variety, or Retrain Model when ready.")
         self._log(f"Recorded {count} frames for '{self.new_gesture_name}'")
 
@@ -774,19 +946,10 @@ class KinesisApp(QMainWindow):
         self._refresh_mapping_rows()
         self._refresh_dataset_info()
         count = self.movements.counts().get(name, 0)
-        self.status_label.setText(f"Saved movement {count} of '{name}'. "
+        self.record_label.setText(f"Saved movement {count} of '{name}'. "
                                   + ("Record 4-5 in total (press + next to it)." if count < 4 else
                                      "It works straight away - pick an action for it in Gesture Mapping."))
         self._log(f"Recorded movement '{name}' ({count} total)")
-
-    def delete_movement(self, name):
-        if not ask(self, "Delete movement?", f"Delete all recordings of the movement '{name}'?"):
-            return
-        self.movements.remove(name)
-        self.gesture_mapping = g.load_mapping(self._known_gestures())
-        self._refresh_mapping_rows()
-        self._refresh_dataset_info()
-        self._log(f"Deleted movement '{name}'")
 
     def cancel_recording(self):
         self.recorded_path = None
@@ -795,12 +958,15 @@ class KinesisApp(QMainWindow):
         self.last_activity_time = time.time()
         self._set_recording_buttons()
         self.warning_label.hide()
-        self.status_label.setText("Recording cancelled.")
+        self.record_label.setText("Recording cancelled.")
 
     # ---------- Learning from mistakes ----------
 
     def mark_mistake(self, source):
         """Saves the hand frames behind the last action as 'not a gesture'."""
+        if self.training is not None:
+            self.status_label.setText("Training in progress - mark the mistake again once it finishes.")
+            return
         fired = self.last_fired
         if fired is None or time.time() - fired["time"] > cfg.MISTAKE_WINDOW:
             self.status_label.setText(f"No action in the last {cfg.MISTAKE_WINDOW:.0f} seconds to mark as a mistake.")
@@ -827,6 +993,8 @@ class KinesisApp(QMainWindow):
         self._refresh_dataset_info()
 
     def clear_mistakes(self):
+        if self._busy_training():
+            return
         df = g.read_dataset()
         pose_mistakes = df is not None and (df["label"] == g.NONE_LABEL).any()
         movement_mistakes = mv.NONE_MOVEMENT in self.movements.counts()
@@ -925,29 +1093,68 @@ class KinesisApp(QMainWindow):
     # ---------- Training and data management ----------
 
     def _retrain(self, done_message):
+        """Trains in a background thread: the camera and gestures keep working with the old model,
+        and the new one is swapped in when it's ready (see _check_training)."""
+        if self.training is not None:
+            self.status_label.setText("Already training - please wait.")
+            return
         if g.read_dataset() is None:
             QMessageBox.warning(self, "No data", "No gesture data recorded yet.")
             return
-        self.status_label.setText("Training... this may take a few seconds.")
+        augment = self.augment_box.isChecked()   # read the checkbox here: Qt widgets belong to this thread
+        self.train_progress, self.train_result = 0.0, None
+        self.train_done_message = done_message
         self.train_btn.setEnabled(False)
-        self._clear_prediction_state()   # no gestures or held buttons while the window is busy
-        self._show_video_message("Retraining Model...")
-        try:
-            self.model, self.encoder, accuracy, raw, used = g.train_model(self.augment_box.isChecked())
-        except Exception as e:
-            self.status_label.setText(f"Training failed: {e}")
-            self._log(f"Retraining FAILED: {e}")
+        self.train_btn.setText("Training... 0%")
+        self.status_label.setText("Training in the background - gestures keep working with the current model.")
+
+        def work():
+            try:
+                self.train_result = ("ok", g.train_model(augment, progress=self._set_train_progress))
+            except Exception as e:   # reported on the main thread
+                self.train_result = ("error", e)
+
+        self.training = threading.Thread(target=work, daemon=True)
+        self.training.start()
+
+    def _set_train_progress(self, fraction):
+        self.train_progress = fraction   # just a number; the main thread shows it
+
+    def _check_training(self):
+        """Runs every frame on the main thread: shows progress, and swaps the new model in when done."""
+        if self.training is None:
             return
-        finally:
-            self.train_btn.setEnabled(True)
-            self.timer.start(cfg.FRAME_INTERVAL_MS)   # camera back on
+        if self.training.is_alive():
+            self.train_btn.setText(f"Training... {self.train_progress:.0%}")
+            return
+        self.training = None
+        self.train_btn.setEnabled(True)
+        self.train_btn.setText("Retrain Model")
+        status, result = self.train_result or ("error", RuntimeError("training stopped unexpectedly"))
+        if status == "error":
+            self.status_label.setText(f"Training failed: {result}")
+            self._log(f"Retraining FAILED: {result}")
+            return
+        self.model, self.encoder, accuracy, raw, used = result
         self._refresh_after_model_change()
         frames = f"{raw} frames -> {used} after augmentation" if used != raw else f"{raw} frames"
-        self.status_label.setText(f"{done_message} {len(self.encoder.classes_)} gestures, {frames}, "
+        message = self.train_done_message
+        self.status_label.setText(f"{message} {len(self.encoder.classes_)} gestures, {frames}, "
                                   f"test accuracy {accuracy:.0%} (often optimistic - trust live testing).")
-        self._log(f"{done_message} test accuracy {accuracy:.1%}, {frames}")
+        self._log(f"{message} test accuracy {accuracy:.1%}, {frames}")
+
+    def _busy_training(self):
+        """True (with a message) if the gesture data mustn't change right now because training is reading it."""
+        if self.training is None:
+            return False
+        QMessageBox.information(self, "Training in progress",
+                                "The model is training in the background. Please wait a few seconds until "
+                                "it finishes, then try again.")
+        return True
 
     def balance_dataset(self):
+        if self._busy_training():
+            return
         df = g.read_dataset()
         mistakes = df[df["label"] == g.NONE_LABEL] if df is not None else None
         df = df[df["label"] != g.NONE_LABEL] if df is not None else None   # saved mistakes are kept as they are
@@ -966,18 +1173,183 @@ class KinesisApp(QMainWindow):
         pd.concat([balanced, mistakes]).to_csv(cfg.CSV_PATH, index=False)
         self._retrain(f"Balanced to {smallest} frames per gesture and retrained.")
 
-    def delete_gesture(self, gesture):
+    def _current_poses(self):
+        """Poses the user has: recorded or in the model, minus deleted ones."""
         df = g.read_dataset()
-        if df is None:
+        recorded = set(df["label"]) if df is not None else set()
+        trained = set(self.encoder.classes_) if self.encoder is not None else set()
+        return sorted((recorded | trained) - self.removed_poses - {g.NONE_LABEL})
+
+    def delete_gesture(self, gesture):
+        self._delete([gesture], [], ask_first=f"Delete the pose '{gesture}'?")
+
+    def delete_movement(self, name):
+        self._delete([], [name], ask_first=f"Delete all recordings of the movement '{name}'?")
+
+    def delete_several(self):
+        dialog = SelectGesturesDialog(self, self._current_poses(), self.movements.labels())
+        if dialog.exec_():
+            chosen = dialog.selected()
+            self._delete([n for n, kind in chosen if kind == "pose"], [n for n, kind in chosen if kind == "movement"],
+                         ask_first=None)
+
+    def _delete(self, poses, moves, ask_first):
+        """Deletes instantly - no retraining. Poses vanish from the list and are ignored by the current
+        model until the next Retrain. Everything goes to a trash file, so it can be undone or restored."""
+        if not poses and not moves or self._busy_training():
             return
-        if df.loc[df["label"] != g.NONE_LABEL, "label"].nunique() <= 2:
-            QMessageBox.warning(self, "Cannot delete", "You need at least 2 gestures to train. "
-                                                       "Add another gesture before deleting this one.")
+        if poses and len(set(self._current_poses()) - set(poses)) < 2:
+            QMessageBox.warning(self, "Cannot delete", "At least 2 static poses must stay so the model can be "
+                                                       "trained. Record another pose first, or use Reset All Data.")
             return
-        if not ask(self, "Delete gesture?", f"Permanently delete all data for '{gesture}' and retrain?"):
+        names = ", ".join(poses + moves)
+        question = ask_first or f"Delete {len(poses) + len(moves)} gesture(s)?\n\n{names}"
+        if not ask(self, "Delete?", question + "\n\nYou can undo this straight after, or restore it later."):
             return
-        df[df["label"] != gesture].to_csv(cfg.CSV_PATH, index=False)
-        self._retrain(f"Deleted '{gesture}' and retrained.")
+        if poses:
+            df = g.read_dataset()
+            gone = df["label"].isin(poses)
+            self._append_trash_rows(df[gone])
+            df[~gone].to_csv(cfg.CSV_PATH, index=False)
+        if moves:
+            trash = self._load_movement_trash()
+            trash += [{"label": label, "path": [list(p) for p in path], "deleted_at": time.time()}
+                      for label, path in self.movements.samples if label in moves]
+            self._save_movement_trash(trash)
+            for name in moves:
+                self.movements.remove(name)
+        self.last_deleted = {"poses": poses, "moves": moves, "time": time.time()}
+        self._log(f"Deleted {names}")
+        self._refresh_after_model_change()
+        self.status_label.setText(f"Deleted {names}.")
+        self.undo_btn.show()
+
+    # Trash: deleted poses (CSV rows) and movements (paths), kept until restored or Reset All Data
+    @staticmethod
+    def _read_pose_trash():
+        """Deleted pose frames, each with the time it was deleted (deleted_at)."""
+        if not os.path.exists(cfg.TRASH_CSV_PATH):
+            return None
+        trash = pd.read_csv(cfg.TRASH_CSV_PATH)
+        if "deleted_at" not in trash:
+            trash["deleted_at"] = time.time()   # from before deletion times were saved: count from now
+        trash["deleted_at"] = trash["deleted_at"].fillna(time.time())
+        return trash
+
+    @classmethod
+    def _append_trash_rows(cls, rows):
+        trash = cls._read_pose_trash()
+        rows = rows.assign(deleted_at=time.time())
+        (rows if trash is None else pd.concat([trash, rows])).to_csv(cfg.TRASH_CSV_PATH, index=False)
+
+    @staticmethod
+    def _load_movement_trash():
+        try:
+            with open(cfg.TRASH_MOVEMENT_PATH) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return []
+
+    @staticmethod
+    def _save_movement_trash(trash):
+        with open(cfg.TRASH_MOVEMENT_PATH, "w") as f:
+            json.dump(trash, f)
+
+    def _trash_contents(self):
+        poses = []
+        if os.path.exists(cfg.TRASH_CSV_PATH):
+            poses = sorted(pd.read_csv(cfg.TRASH_CSV_PATH)["label"].unique())
+        moves = sorted({item["label"] for item in self._load_movement_trash()})
+        return poses, moves
+
+    def _clean_trash(self):
+        """Permanently removes gestures that have been in the trash longer than TRASH_KEEP_DAYS."""
+        cutoff = time.time() - cfg.TRASH_KEEP_DAYS * 24 * 3600
+        removed = set()
+        trash = self._read_pose_trash()
+        if trash is not None:
+            old = trash["deleted_at"] < cutoff
+            removed |= set(trash.loc[old, "label"])
+            if old.all():
+                os.remove(cfg.TRASH_CSV_PATH)
+            elif old.any():
+                trash[~old].to_csv(cfg.TRASH_CSV_PATH, index=False)
+        moves = self._load_movement_trash()
+        keep = [item for item in moves if item.get("deleted_at", time.time()) >= cutoff]
+        if len(keep) != len(moves):
+            removed |= {item["label"] for item in moves if item not in keep}
+            self._save_movement_trash(keep)
+        if removed:
+            self._log(f"Trash: permanently removed {', '.join(sorted(removed))} "
+                      f"(deleted more than {cfg.TRASH_KEEP_DAYS} days ago)")
+
+    def empty_trash(self):
+        poses, moves = self._trash_contents()
+        if not poses and not moves:
+            QMessageBox.information(self, "Trash is empty", "There are no deleted gestures.")
+            return
+        names = ", ".join(poses + moves)
+        if not ask(self, "Empty trash?", f"Permanently delete these deleted gestures? They can't be restored "
+                                         f"after this.\n\n{names}"):
+            return
+        for path in (cfg.TRASH_CSV_PATH, cfg.TRASH_MOVEMENT_PATH):
+            if os.path.exists(path):
+                os.remove(path)
+        self.last_deleted = None   # nothing left to undo
+        self.undo_btn.hide()
+        self._log(f"Emptied trash: {names}")
+        self.status_label.setText("Trash emptied.")
+
+    def undo_delete(self):
+        if self.last_deleted is not None:
+            self._restore(self.last_deleted["poses"], self.last_deleted["moves"])
+        self.last_deleted = None
+        self.undo_btn.hide()
+
+    def restore_deleted(self):
+        poses, moves = self._trash_contents()
+        if not poses and not moves:
+            QMessageBox.information(self, "Nothing to restore", "There are no deleted gestures.")
+            return
+        dialog = SelectGesturesDialog(self, poses, moves, restore=True)
+        if dialog.exec_():
+            chosen = dialog.selected()
+            self._restore([n for n, kind in chosen if kind == "pose"], [n for n, kind in chosen if kind == "movement"])
+
+    def _restore(self, poses, moves):
+        """Brings deleted gestures back from the trash."""
+        if self._busy_training():
+            return
+        taken = set(self._current_poses()) | set(self.movements.labels())
+        clash = sorted(set(poses + moves) & taken)
+        if clash:
+            QMessageBox.warning(self, "Name in use", f"You already have a gesture called {', '.join(clash)}. "
+                                                     "Rename or delete it first, then restore.")
+            return
+        needs_retrain = []
+        if poses and os.path.exists(cfg.TRASH_CSV_PATH):
+            trash = self._read_pose_trash()
+            back = trash["label"].isin(poses)
+            rows = trash[back].drop(columns="deleted_at")
+            df = g.read_dataset()
+            pd.concat([df, rows] if df is not None else [rows]).to_csv(cfg.CSV_PATH, index=False)
+            if back.all():
+                os.remove(cfg.TRASH_CSV_PATH)
+            else:
+                trash[~back].to_csv(cfg.TRASH_CSV_PATH, index=False)
+            known = set(self.encoder.classes_) if self.encoder is not None else set()
+            needs_retrain = [p for p in poses if p not in known]
+        if moves:
+            trash = self._load_movement_trash()
+            for item in trash:
+                if item["label"] in moves:
+                    self.movements.add(item["label"], item["path"])
+            self._save_movement_trash([item for item in trash if item["label"] not in moves])
+        names = ", ".join(poses + moves)
+        self._log(f"Restored {names}")
+        self._refresh_after_model_change()
+        self.status_label.setText(f"Restored {names}." + (
+            f" Click Retrain Model to use {', '.join(needs_retrain)} again." if needs_retrain else ""))
 
     def run_self_test(self):
         if self.model is None:
@@ -1021,11 +1393,18 @@ class KinesisApp(QMainWindow):
                 os.remove(path)
 
     def reset_all_data(self):
+        if self._busy_training():
+            return
         if not ask(self, "Reset everything?",
                    "Permanently delete all recorded gestures, the trained model and your mapping?\n\n"
                    "Your saved defaults are kept - use Restore Defaults to get them back."):
             return
         self._remove_data_files()
+        for path in (cfg.TRASH_CSV_PATH, cfg.TRASH_MOVEMENT_PATH):
+            if os.path.exists(path):
+                os.remove(path)
+        self.last_deleted = None
+        self.undo_btn.hide()
         self.movements.load()
         self.model = self.encoder = None
         self.mode = "normal"
@@ -1034,13 +1413,15 @@ class KinesisApp(QMainWindow):
         self.warning_label.hide()
         self._set_recording_buttons()
         self._refresh_after_model_change()
-        self.gesture_label.setText("Gesture: none")
-        self.confidence_label.setText("Confidence: -")
+        self.gesture_label.setText("No hand in view")
+        self.confidence_label.setText("")
         self.last_action_label.setText("Last action: -")
         self.status_label.setText("Everything reset. Record new gestures, or Restore Defaults.")
         self._log("Full reset: all data, model, and mapping deleted")
 
     def save_as_default(self):
+        if self._busy_training():
+            return
         if self.model is None:
             QMessageBox.warning(self, "No model", "Train a model first, then save it as the default.")
             return
@@ -1054,6 +1435,8 @@ class KinesisApp(QMainWindow):
         self._log("Saved current setup as default")
 
     def restore_defaults(self):
+        if self._busy_training():
+            return
         if not self._has_backup():
             QMessageBox.information(self, "No defaults", "No saved default found. Use Save as Default first.")
             self.restore_btn.setEnabled(False)
@@ -1092,6 +1475,7 @@ class KinesisApp(QMainWindow):
         while actions.messages:
             self._log(actions.messages.pop(0))
         self._check_mistake_hotkey()
+        self._check_training()
         frame, self.frame_id = self.camera.latest(self.frame_id)
         if frame is None:   # no new frame yet
             if time.time() - self.camera.last_frame_time > 3 and self.camera.is_opened():
@@ -1099,6 +1483,7 @@ class KinesisApp(QMainWindow):
             return
 
         t0 = time.perf_counter()
+        self.hand_view = {}
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         hands = self._find_hands(self.hands.process(rgb), frame)
@@ -1125,13 +1510,94 @@ class KinesisApp(QMainWindow):
 
         if self.show_speed:
             self._draw_speed(frame)
+        self._render_live(now)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         image = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(image).scaled(
-            self.video_label.width(), self.video_label.height(), Qt.KeepAspectRatio))
+        picture = QPixmap.fromImage(image).scaled(self.video_label.size(), Qt.KeepAspectRatio,
+                                                  Qt.SmoothTransformation)
+        self.video_label.setPixmap(self._rounded(picture, 14))
         t3 = time.perf_counter()
         self._update_timing(t0, t1, t2, t3)
+
+    @staticmethod
+    def _rounded(picture, radius):
+        """The video with rounded corners."""
+        result = QPixmap(picture.size())
+        result.fill(Qt.transparent)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(result.rect()), radius, radius)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, picture)
+        painter.end()
+        return result
+
+    def _render_live(self, now):
+        """Updates the hand tiles and the status pill from this frame's results."""
+        if self.last_deleted is not None and time.time() - self.last_deleted["time"] > cfg.UNDO_SECONDS:
+            self.last_deleted = None
+            self.undo_btn.hide()
+        for label, tile in self.hand_tiles.items():
+            trail = self.trails.get(label)
+            if trail is not None and trail["text"] != "not recognised" and now <= trail["until"]:
+                action = ACTIONS[self.gesture_mapping.get(trail["text"], "none")]
+                tile.show_hand("↝ " + trail["text"], 1.0,
+                               f"→ {action.label}" if action.fn is not None else "movement", "move")
+            elif label in self.hand_view:
+                tile.show_hand(*self.hand_view[label])
+            else:
+                tile.show_hand(None, 0.0, "not in view", None)
+        if self.mode == "recording":
+            state, text = "rec", "●  REC"
+        elif self.mode == "reviewing":
+            state, text = "review", "REVIEW"
+        elif self.mode == "locked":
+            state, text = "locked", "LOCKED"
+        elif self.paused:
+            state, text = "paused", "❚❚  PAUSED"
+        else:
+            state, text = "live", "●  LIVE"
+        if text != self.status_pill_text:
+            self.status_pill_text = text
+            self.status_pill.setText(text)
+            self.status_pill.setProperty("state", state)
+            self.status_pill.style().unpolish(self.status_pill)
+            self.status_pill.style().polish(self.status_pill)
+
+    def _set_hand_view(self, label, gesture, confidence, action_key):
+        """What a hand's tile shows: its gesture, confidence and the action it runs."""
+        if gesture is None:
+            self.hand_view[label] = (None, confidence, "unsure", "low")
+            return
+        shown = "not a gesture" if gesture == g.NONE_LABEL else gesture
+        action = ACTIONS.get(action_key or "none", ACTIONS["none"])
+        if self.paused:
+            detail = "paused - no action"
+        elif action_key in (None, "none"):
+            detail = "no action"
+        else:
+            detail = f"→ {action.label}"
+        level = "good" if confidence >= self.confidence_threshold else "low"
+        self.hand_view[label] = (shown, confidence, detail, level)
+
+    def _make_hand_tracker(self):
+        """MediaPipe Hands. The lite model (complexity 0) is faster; the full one (1) is a little more precise."""
+        return mp_hands.Hands(max_num_hands=2, model_complexity=0 if self.lite_tracking else 1,
+                              min_detection_confidence=0.7, min_tracking_confidence=0.7)
+
+    def on_lite_toggled(self, state):
+        self.lite_tracking = state == Qt.Checked
+        self.hands.close()
+        self.hands = self._make_hand_tracker()
+        self._clear_prediction_state()
+        self.settings["lite_tracking"] = self.lite_tracking
+        save_settings(self.settings)
+        self._log(f"Hand tracking model: {'lite (faster)' if self.lite_tracking else 'full'}")
+        self.status_label.setText("Lite hand tracking on - compare 'Hand tracking ms' in the speed readout, "
+                                  "and check your gestures still work well." if self.lite_tracking
+                                  else "Full hand tracking on.")
 
     def on_trail_toggled(self, state):
         self.show_trail = state == Qt.Checked
@@ -1199,6 +1665,8 @@ class KinesisApp(QMainWindow):
                  f"Hand tracking {t['tracking']:4.1f} ms",
                  f"Gestures+actions {t['gestures']:4.1f} ms",
                  f"Display {t['display']:4.1f} ms"]
+        box = frame[6:92, 4:345]
+        box[:] = (box * 0.35).astype(box.dtype)   # dark backdrop so the numbers are readable
         for i, text in enumerate(lines):
             y = 22 + i * 20
             cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 255, 120), 1, cv2.LINE_AA)
@@ -1225,14 +1693,14 @@ class KinesisApp(QMainWindow):
         self.gesture_label.setText("Locked")
         if self.model is None or self.unlock_gesture is None or not hands:
             self.unlock_hold_start = None
-            self.confidence_label.setText("Confidence: -")
+            self.confidence_label.setText("")
             self.status_label.setText(self._lock_message())
             return
         matches = [conf for gesture, conf in (g.predict(self.model, self.encoder, lm) for _, lm in hands)
                    if gesture == self.unlock_gesture and conf >= self.confidence_threshold]
         if not matches:
             self.unlock_hold_start = None
-            self.confidence_label.setText("Confidence: -")
+            self.confidence_label.setText("")
             self.status_label.setText(self._lock_message())
             return
         if self.unlock_hold_start is None:
@@ -1251,11 +1719,11 @@ class KinesisApp(QMainWindow):
         if self.paused or QApplication.activeModalWidget() is not None:
             # Paused, or a dialog is open (a gesture click must never press "Yes" on Reset All Data).
             self._clear_prediction_state()
-            self.gesture_label.setText("Gesture: (paused)" if self.paused else "Gesture: (dialog open)")
-            self.confidence_label.setText("Confidence: -")
+            self.gesture_label.setText("Paused" if self.paused else "Dialog open - gestures off")
+            self.confidence_label.setText("")
             return
         if self.model is None:
-            self.gesture_label.setText("Gesture: none (record and train poses first)")
+            self.gesture_label.setText("No poses trained yet")
             self._update_movements(hands, {}, now)   # movements don't need the pose model
             return
 
@@ -1270,16 +1738,15 @@ class KinesisApp(QMainWindow):
                 return
             if remaining <= cfg.IDLE_LOCK_WARNING:
                 self.status_label.setText(f"No hand detected - locking in {int(remaining) + 1}s...")
-            self.gesture_label.setText("Gesture: none")
-            self.confidence_label.setText("Confidence: -")
+            self.gesture_label.setText("No hand in view")
+            self.confidence_label.setText("")
 
-        action_keys, parts = {}, []
+        action_keys = {}
         self.cursor_used = False
         for label, landmarks in hands:
             gesture, confidence, action_key = self._process_hand(label, landmarks)
             action_keys[label] = action_key
-            shown = "not a gesture" if gesture == g.NONE_LABEL else gesture
-            parts.append(f"{label}: {shown} ({confidence:.0%})" if gesture else f"{label}: none")
+            self._set_hand_view(label, gesture, confidence, action_key)
         for label, state in self.hand_states.items():
             if label not in action_keys:
                 state.push(None)
@@ -1288,8 +1755,8 @@ class KinesisApp(QMainWindow):
             self.cursor.reset()   # next time the cursor starts fresh from the hand's position
         self._update_movements(hands, action_keys, now)
         if hands:
-            self.gesture_label.setText("Gesture -> " + "  |  ".join(parts))
-            self.confidence_label.setText(f"Hands detected: {len(hands)}")
+            self.gesture_label.setText("Recognising")
+            self.confidence_label.setText(f"{len(hands)} hand{'s' if len(hands) > 1 else ''} in view")
 
         both_unhooked = len(hands) == 2 and all(action_keys.get(label) == "none" for label, _ in hands)
         if self.zoom_enabled and both_unhooked:
@@ -1419,21 +1886,21 @@ class KinesisApp(QMainWindow):
 
     def _show_gestures_only(self, hands):
         """While paused: recognise and show each hand's gesture, but run no actions at all."""
-        parts = []
         for label, landmarks in hands:
             gesture, confidence = g.predict(self.model, self.encoder, landmarks)
-            if confidence >= self.confidence_threshold:
-                shown = "not a gesture" if gesture == g.NONE_LABEL else gesture
-                parts.append(f"{label}: {shown} ({confidence:.0%})")
-            else:
-                parts.append(f"{label}: none")
-        self.gesture_label.setText("Gesture (paused) -> " + "  |  ".join(parts) if parts else "Gesture: (paused)")
-        self.confidence_label.setText(f"Hands detected: {len(hands)} - recognition paused, no actions")
+            if gesture in self.removed_poses:
+                gesture = None
+            self._set_hand_view(label, gesture if confidence >= self.confidence_threshold else None,
+                                confidence, None)
+        self.gesture_label.setText("Paused - gestures shown, no actions")
+        self.confidence_label.setText(f"{len(hands)} hand{'s' if len(hands) != 1 else ''} in view")
 
     def _process_hand(self, label, landmarks):
         """Predicts one hand's gesture and runs its action. Returns (stable_gesture, confidence, action_key)."""
         features = g.normalize_landmarks(landmarks)
         gesture, confidence = g.predict_features(self.model, self.encoder, features)
+        if gesture in self.removed_poses:
+            gesture = None   # deleted, waiting for Retrain: ignore it
         state = self.hand_states[label]
         state.features.append(features)
         state.push(gesture if confidence >= self.confidence_threshold else None)
@@ -1526,6 +1993,15 @@ class KinesisApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")   # draws the same on every Windows version, and follows the stylesheet closely
+    palette = app.palette()   # dark defaults for anything the stylesheet doesn't cover (dialogs, scroll areas)
+    for role, color in ((QPalette.Window, "#120c20"), (QPalette.Base, "#160f29"), (QPalette.AlternateBase, "#1b1430"),
+                        (QPalette.WindowText, "#ece6fa"), (QPalette.Text, "#ece6fa"), (QPalette.Button, "#241a3d"),
+                        (QPalette.ButtonText, "#ece6fa"), (QPalette.Highlight, "#7c4dff"),
+                        (QPalette.HighlightedText, "#ffffff"), (QPalette.ToolTipBase, "#241a3d"),
+                        (QPalette.ToolTipText, "#ece6fa")):
+        palette.setColor(role, QColor(color))
+    app.setPalette(palette)
     app.setStyleSheet(STYLESHEET)
     window = KinesisApp()
     window.show()

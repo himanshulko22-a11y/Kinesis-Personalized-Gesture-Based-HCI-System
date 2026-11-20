@@ -8,6 +8,8 @@ activity_log.txt*
 screenshots/
 screenshot_*.png
 settings.json
+deleted_gestures.csv
+deleted_movements.json
 
 # The *_backup files ARE uploaded: they are the default dataset and model
 # (what Save as Default writes and Restore Defaults loads).

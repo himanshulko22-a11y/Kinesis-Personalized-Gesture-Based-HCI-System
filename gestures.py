@@ -255,8 +255,9 @@ def load_trained_model():
     return model, encoder
 
 
-def train_model(augment=True):
-    """Trains on the CSV and saves the model. Returns (model, encoder, held_out_accuracy, raw_rows, train_rows)."""
+def train_model(augment=True, progress=None):
+    """Trains on the CSV and saves the model. Returns (model, encoder, held_out_accuracy, raw_rows, train_rows).
+    Safe to run in a background thread. progress(fraction) is called after each epoch."""
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import LabelEncoder
     from tensorflow import keras
@@ -281,7 +282,7 @@ def train_model(augment=True):
     if augment:
         X_train, y_train = augment_landmarks(X_train, y_train)
 
-    keras.backend.clear_session()
+    # (no keras.backend.clear_session() here: the old model keeps recognising gestures while this trains)
     model = keras.Sequential([
         layers.Input(shape=(X.shape[1],)),
         layers.Dense(64, activation="relu"),
@@ -289,7 +290,13 @@ def train_model(augment=True):
         layers.Dense(len(encoder.classes_), activation="softmax"),
     ])
     model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=60, batch_size=16, verbose=0)
+    epochs = 60
+    callbacks = []
+    if progress is not None:
+        callbacks.append(keras.callbacks.LambdaCallback(
+            on_epoch_end=lambda epoch, logs: progress((epoch + 1) / epochs)))
+    model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=epochs, batch_size=16, verbose=0,
+              callbacks=callbacks)
     _, accuracy = model.evaluate(X_test, y_test, verbose=0)
 
     model.save(cfg.MODEL_PATH)

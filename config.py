@@ -27,6 +27,11 @@ SETTINGS_PATH = _path("settings.json")   # choices made in the app, e.g. the mis
 ICON_PATH = os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "favicon.ico")
 
 DATA_FILES = [CSV_PATH, MODEL_PATH, ENCODER_PATH, MAPPING_PATH, MOVEMENT_DATA_PATH]
+TRASH_CSV_PATH = os.path.join(BASE_DIR, "deleted_gestures.csv")          # deleted poses, for Undo / Restore
+TRASH_MOVEMENT_PATH = os.path.join(BASE_DIR, "deleted_movements.json")  # deleted movements, for Undo / Restore
+UNDO_SECONDS = 15             # how long the Undo link stays after a delete
+TRASH_KEEP_DAYS = 30          # deleted gestures are removed for good after this many days
+LITE_TRACKING = False         # True = MediaPipe's lighter, faster hand model (landmarks differ slightly)
 BACKUP_PAIRS = [(path, _backup_of(path)) for path in DATA_FILES]  # (current file, saved default)
 
 # Recognition

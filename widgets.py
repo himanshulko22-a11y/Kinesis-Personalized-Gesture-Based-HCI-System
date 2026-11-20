@@ -2,37 +2,40 @@
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QProgressBar, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+import config as cfg
 from actions import ACTIONS
 
 
 # ---------- Small UI helpers ----------
 
-def section_title(text):
+def field_label(text):
+    """Small label above a control inside a section (e.g. a slider's name)."""
     label = QLabel(text)
-    label.setObjectName("sectionTitle")
+    label.setObjectName("fieldLabel")
     return label
 
 
-class CollapsibleSection(QWidget):
-    """A section title you can click to show or hide what's under it."""
+class CollapsibleSection(QFrame):
+    """A card with a title you can click to show or hide what's inside."""
 
     def __init__(self, title, expanded=True, on_toggle=None, danger=False):
         super().__init__()
+        self.setObjectName("dangerCard" if danger else "sectionCard")
         self.title, self.on_toggle = title, on_toggle
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(0)
         self.header = QPushButton()
         self.header.setObjectName("dangerHeader" if danger else "sectionHeader")
         self.header.setCursor(Qt.PointingHandCursor)
         self.header.clicked.connect(self.toggle)
         self.body = QWidget()
         self.content = QVBoxLayout(self.body)
-        self.content.setContentsMargins(6, 2, 0, 8)
+        self.content.setContentsMargins(14, 0, 14, 12)
         layout.addWidget(self.header)
         layout.addWidget(self.body)
         self.set_expanded(expanded)
@@ -40,12 +43,56 @@ class CollapsibleSection(QWidget):
     def set_expanded(self, expanded):
         self.expanded = expanded
         self.body.setVisible(expanded)
-        self.header.setText(("▾   " if expanded else "▸   ") + self.title)
+        # '&' would be read as a keyboard-shortcut marker by QPushButton, so it is doubled
+        self.header.setText(("▾   " if expanded else "▸   ") + self.title.replace("&", "&&"))
 
     def toggle(self):
         self.set_expanded(not self.expanded)
         if self.on_toggle:
             self.on_toggle(self.title, self.expanded)
+
+
+class HandTile(QFrame):
+    """Live view of one hand: its gesture, how sure the model is, and what it does."""
+
+    def __init__(self, side):
+        super().__init__()
+        self.setObjectName("handTile")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 12)
+        layout.setSpacing(4)
+        caption = QLabel(f"{side.upper()} HAND")
+        caption.setObjectName("tileCaption")
+        self.name = QLabel("—")
+        self.name.setObjectName("tileGesture")
+        self.bar = QProgressBar()
+        self.bar.setObjectName("confBar")
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(6)
+        self.detail = QLabel(" ")
+        self.detail.setObjectName("tileDetail")
+        for widget in (caption, self.name, self.bar, self.detail):
+            layout.addWidget(widget)
+        self._shown = None
+        self._level = None
+
+    def show_hand(self, name, confidence, detail, level):
+        """level: "good" (confident), "low" (below the threshold), "move" (a movement), or None (no hand)."""
+        shown = (name, round(confidence * 100), detail, level)
+        if shown == self._shown:
+            return   # nothing changed: skip re-styling (runs every frame)
+        self._shown = shown
+        self.name.setText(name or "—")
+        self.bar.setValue(round(confidence * 100))
+        self.detail.setText(detail or " ")
+        if level != self._level:
+            self._level = level
+            for widget in (self, self.name, self.bar):
+                widget.setProperty("level", level or "none")
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
 
 
 def note(text):
@@ -79,14 +126,79 @@ def ask(parent, title, text):
 
 # ---------- Dialog / row widgets ----------
 
+class SelectGesturesDialog(QDialog):
+    """Tick several gestures and delete them together (poses are retrained only once)."""
+
+    def __init__(self, parent, poses, movements, restore=False):
+        super().__init__(parent)
+        self.restore = restore
+        self.setWindowTitle("Restore Deleted Gestures" if restore else "Delete Several Gestures")
+        self.resize(380, 520)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(note(
+            "Tick what you want back. A restored pose works straight away if the model still knows it; "
+            f"otherwise click Retrain Model. Deleted gestures are kept for {cfg.TRASH_KEEP_DAYS} days." if restore else
+            "Tick everything you want to delete. It's instant - no retraining now. Deleted poses are "
+            "ignored until you next click Retrain Model, and everything can be restored later."))
+        self.list = QListWidget()
+        for title, names, kind in (("STATIC POSES", poses, "pose"), ("MOVEMENTS", movements, "movement")):
+            if not names:
+                continue
+            header = QListWidgetItem(title)
+            header.setFlags(Qt.NoItemFlags)   # a heading, not something to tick
+            self.list.addItem(header)
+            for name in names:
+                item = QListWidgetItem(name)
+                item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                item.setCheckState(Qt.Unchecked)
+                item.setData(Qt.UserRole, kind)
+                self.list.addItem(item)
+        self.list.itemChanged.connect(self._update_count)
+        layout.addWidget(self.list, 1)
+
+        row = QHBoxLayout()
+        for text, state in (("Select all", Qt.Checked), ("Select none", Qt.Unchecked)):
+            link = button(text, lambda state=state: self._set_all(state), name="linkBtn")
+            row.addWidget(link)
+        row.addStretch()
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        self.delete_btn = button("Restore" if restore else "Delete", self.accept,
+                                 name=None if restore else "deleteBtn")
+        row.addWidget(self.delete_btn)
+        row.addWidget(button("Cancel", self.reject, name="secondaryBtn"))
+        layout.addLayout(row)
+        self._update_count()
+
+    def _items(self):
+        items = (self.list.item(i) for i in range(self.list.count()))
+        return [item for item in items if item.flags() & Qt.ItemIsUserCheckable]
+
+    def _set_all(self, state):
+        for item in self._items():
+            item.setCheckState(state)
+
+    def _update_count(self, *_):
+        count = len(self.selected())
+        verb = "Restore" if self.restore else "Delete"
+        self.delete_btn.setText(f"{verb} {count} selected" if count else verb)
+        self.delete_btn.setEnabled(count > 0)
+
+    def selected(self):
+        """[(name, "pose" or "movement"), ...] that are ticked."""
+        return [(item.text(), item.data(Qt.UserRole)) for item in self._items() if item.checkState() == Qt.Checked]
+
 class GestureMappingRow(QWidget):
     def __init__(self, gesture, action, on_change, on_record_more, on_delete, on_rename=None, movement=False):
         super().__init__()
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(6)
 
         name = QLabel(gesture)
-        name.setMinimumWidth(90)
+        name.setObjectName("mappingName")
+        name.setFixedWidth(110)
         layout.addWidget(name)
 
         self.combo = QComboBox()
@@ -96,22 +208,18 @@ class GestureMappingRow(QWidget):
             self.combo.addItem(info.label, userData=key)
         self.combo.setCurrentIndex(max(0, self.combo.findData(action)))
         self.combo.currentIndexChanged.connect(lambda: on_change(gesture, self.combo.currentData()))
-        layout.addWidget(self.combo)
+        layout.addWidget(self.combo, 1)
 
-        more = button("+", lambda: on_record_more(gesture),
-                      f"Record another '{gesture}' movement" if movement else f"Record more samples for '{gesture}'")
-        more.setFixedWidth(34)
-        more.setStyleSheet("padding: 0px; font-size: 16px;")   # default padding hid the "+"
-        layout.addWidget(more)
-
+        icons = [("+", lambda: on_record_more(gesture), "iconBtn",
+                  f"Record another '{gesture}' movement" if movement else f"Record more samples for '{gesture}'")]
         if on_rename is not None:
-            rename = button("Rename", lambda: on_rename(gesture), f"Give '{gesture}' a new name")
-            rename.setFixedWidth(85)
-            layout.addWidget(rename)
-
-        delete = button("Delete", lambda: on_delete(gesture), name="deleteBtn")
-        delete.setFixedWidth(85)
-        layout.addWidget(delete)
+            icons.append(("✎", lambda: on_rename(gesture), "iconBtn", f"Rename '{gesture}'"))
+        icons.append(("✕", lambda: on_delete(gesture), "iconDeleteBtn", f"Delete '{gesture}'"))
+        for text, on_click, style, tip in icons:
+            icon = button(text, on_click, tip, name=style)
+            icon.setFixedSize(30, 30)
+            icon.setCursor(Qt.PointingHandCursor)
+            layout.addWidget(icon)
 
 
 class ConfusionMatrixDialog(QDialog):
