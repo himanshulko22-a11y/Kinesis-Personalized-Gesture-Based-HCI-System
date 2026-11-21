@@ -57,8 +57,6 @@ class KinesisApp(QMainWindow):
         self.setWindowTitle("Kinesis - Personalized Gesture Control")
         self.setGeometry(60, 40, 1320, 820)
         self.setMinimumSize(1000, 660)
-        if os.path.exists(cfg.ICON_PATH):
-            self.setWindowIcon(QIcon(cfg.ICON_PATH))
 
         load_error = self._load_model()
 
@@ -2189,8 +2187,38 @@ class KinesisApp(QMainWindow):
         event.accept()
 
 
+def app_icon():
+    """The Kinesis icon: favicon.ico if present, otherwise drawn here (purple rounded square, white K)."""
+    if os.path.exists(cfg.ICON_PATH):
+        return QIcon(cfg.ICON_PATH)
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):   # crisp at every size Windows asks for
+        picture = QPixmap(size, size)
+        picture.fill(Qt.transparent)
+        painter = QPainter(picture)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#7c4dff"))
+        painter.drawRoundedRect(QRectF(0, 0, size, size), size * 0.22, size * 0.22)
+        font = QFont("Segoe UI", 1)
+        font.setBold(True)
+        font.setPixelSize(int(size * 0.68))
+        painter.setFont(font)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(QRectF(0, -size * 0.03, size, size), Qt.AlignCenter, "K")
+        painter.end()
+        icon.addPixmap(picture)
+    return icon
+
+
 def main():
+    if sys.platform == "win32":
+        # Its own taskbar identity, so Windows shows the Kinesis icon there instead of Python's
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("kinesis.gesture.control")
     app = QApplication(sys.argv)
+    app.setWindowIcon(app_icon())   # every window and dialog gets it
     app.setStyle("Fusion")   # draws the same on every Windows version, and follows the stylesheet closely
     palette = app.palette()   # dark defaults for anything the stylesheet doesn't cover (dialogs, scroll areas)
     for role, color in ((QPalette.Window, "#120c20"), (QPalette.Base, "#160f29"), (QPalette.AlternateBase, "#1b1430"),
