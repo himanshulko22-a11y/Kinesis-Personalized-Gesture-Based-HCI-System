@@ -95,15 +95,89 @@ class LiveTest:
                     grid[index[target]][index[UNSURE]] += count
         return names, grid
 
-    def save(self, path, note=""):
-        """Appends one row per pose to a CSV, so several runs (or people) can be compared in the report."""
+    def save(self, path, tracking, stopped=False):
+        """Appends this run to a CSV: one OVERALL row, then one row per pose (weakest first). Every row carries
+        the run number, so runs are easy to tell apart and to compare (filter or pivot on "run" in Excel)."""
+        upgrade_old_format(path)
+        runs = read_runs(path)
+        run = max(runs, default=0) + 1
+        now = time.localtime()
+        base = [run, time.strftime("%Y-%m-%d", now), time.strftime("%H:%M", now), tracking]
+        total = sum(self.frames.values())
+        rows = [base + ["OVERALL", _pct(self.overall()), total, sum(self.correct.values()),
+                        sum(self.no_hand.values()), "", "", _pct(self.threshold), "yes" if stopped else "no"]]
+        for accuracy, pose, n, wrong, share in self.results():
+            rows.append(base + [pose, _pct(accuracy), n, self.correct[pose], self.no_hand[pose], wrong or "",
+                                _pct(share) if wrong else "", _pct(self.threshold), "yes" if stopped else "no"])
         new_file = not os.path.exists(path)
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(path, "a", newline="") as f:
             writer = csv.writer(f)
             if new_file:
-                writer.writerow(["time", "note", "pose", "frames", "accuracy", "most_confused_with", "confused_share",
-                                 "no_hand_frames", "threshold"])
-            for accuracy, pose, n, wrong, share in self.results():
-                writer.writerow([stamp, note, pose, n, "" if accuracy is None else round(accuracy, 4),
-                                 wrong or "", round(share, 4), self.no_hand[pose], self.threshold])
+                writer.writerow(COLUMNS)
+            writer.writerows(rows)
+        keep_newest_runs(path, cfg.LIVE_TEST_KEEP_RUNS)
+        return run
+
+
+COLUMNS = ["run", "date", "time", "tracking", "pose", "accuracy_%", "frames", "correct_frames", "no_hand_frames",
+           "most_confused_with", "confused_%", "threshold_%", "stopped_early"]
+
+
+def _pct(value):
+    return "" if value is None else round(value * 100, 1)
+
+
+def read_runs(path):
+    """Run numbers already in the file."""
+    if not os.path.exists(path):
+        return set()
+    with open(path, newline="") as f:
+        return {int(row["run"]) for row in csv.DictReader(f) if row.get("run", "").isdigit()}
+
+
+def keep_newest_runs(path, keep):
+    """Deletes all but the newest `keep` runs from the results file."""
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    newest = sorted({int(row["run"]) for row in rows})[-keep:]
+    kept = [row for row in rows if int(row["run"]) in newest]
+    if len(kept) == len(rows):
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(kept)
+
+
+def upgrade_old_format(path):
+    """Rewrites a results file from the first version (no run numbers) into the current layout."""
+    if not os.path.exists(path):
+        return
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or "run" in reader.fieldnames:
+            return
+        old = list(reader)
+    rows, runs = [], {}
+    for row in old:
+        runs.setdefault(row["time"], []).append(row)
+    for run, (stamp, items) in enumerate(runs.items(), start=1):
+        date, clock = stamp.split(" ")[0], stamp.split(" ")[-1][:5]
+        tracking = items[0]["note"].split(",")[0].replace(" tracking", "")
+        stopped = "yes" if "stopped" in items[0]["note"] else "no"
+        threshold = _pct(float(items[0]["threshold"]))
+        frames = sum(int(r["frames"]) for r in items)
+        correct = sum(round(float(r["accuracy"] or 0) * int(r["frames"])) for r in items)
+        base = [run, date, clock, tracking]
+        rows.append(base + ["OVERALL", _pct(correct / frames) if frames else "", frames, correct,
+                            sum(int(r["no_hand_frames"]) for r in items), "", "", threshold, stopped])
+        for r in sorted(items, key=lambda r: float(r["accuracy"]) if r["accuracy"] else -1):
+            n = int(r["frames"])
+            acc = float(r["accuracy"]) if r["accuracy"] else None
+            rows.append(base + [r["pose"], _pct(acc), n, round((acc or 0) * n), r["no_hand_frames"],
+                                r["most_confused_with"], _pct(float(r["confused_share"])) if r["most_confused_with"] else "",
+                                threshold, stopped])
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(COLUMNS)
+        writer.writerows(rows)

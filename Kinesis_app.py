@@ -332,17 +332,6 @@ class KinesisApp(QMainWindow):
         for widget in (self.record_btn, tips_btn, self.train_btn):
             row.addWidget(widget)
         box.addLayout(row)
-        row = QHBoxLayout()
-        row.addWidget(button("Evaluate Accuracy", self.run_self_test,
-                             "Tests the model on the newest 20% of each gesture's recordings - frames it "
-                             "never trained on - and shows accuracy per gesture and a confusion matrix.",
-                             name="secondaryBtn"))
-        self.live_test_btn = button("Live Test", self.toggle_live_test,
-                                    "Kinesis asks for each pose in turn and scores fresh frames from the camera - "
-                                    "the real-world accuracy (today's light, position and hand).",
-                                    name="secondaryBtn")
-        row.addWidget(self.live_test_btn)
-        box.addLayout(row)
         self.record_label = QLabel("")   # recording progress and results
         self.record_label.setObjectName("statusLabel")
         self.record_label.setWordWrap(True)
@@ -360,6 +349,23 @@ class KinesisApp(QMainWindow):
         self.cancel_btn = button("Cancel", self.cancel_recording, name="deleteBtn")
         for widget in (self.save_btn, self.save_more_btn, self.retake_btn, self.cancel_btn):
             row.addWidget(widget)
+        box.addLayout(row)
+
+        box = self._section(col, "Testing", False)
+        box.addWidget(note("Evaluate Accuracy checks the model on recorded frames it never trained on (quick). "
+                           "Live Test asks for each pose and scores fresh camera frames - the real-world "
+                           "accuracy. Live Test results are saved to "
+                           f"{os.path.basename(cfg.LIVE_TEST_PATH)} (the last {cfg.LIVE_TEST_KEEP_RUNS} runs)."))
+        row = QHBoxLayout()
+        row.addWidget(button("Evaluate Accuracy", self.run_self_test,
+                             "Tests the model on the newest 20% of each gesture's recordings - frames it "
+                             "never trained on - and shows accuracy per gesture and a confusion matrix.",
+                             name="secondaryBtn"))
+        self.live_test_btn = button("Live Test", self.toggle_live_test,
+                                    "Kinesis asks for each pose in turn and scores fresh frames from the camera - "
+                                    "the real-world accuracy (today's light, position and hand).",
+                                    name="secondaryBtn")
+        row.addWidget(self.live_test_btn)
         box.addLayout(row)
 
         box = self._section(col, "Sensitivity", False)
@@ -1495,10 +1501,12 @@ class KinesisApp(QMainWindow):
         if overall is None:
             self.status_label.setText("Live Test stopped - no poses were scored.")
             return
-        note = ("lite tracking" if self.lite_tracking else "full tracking") + (", stopped early" if stopped else "")
+        tracking = "lite" if self.lite_tracking else "full"
+        note = f"{tracking} tracking" + (", stopped early" if stopped else "")
+        saved = None
         try:
-            test.save(cfg.LIVE_TEST_PATH, note)
-        except OSError as e:
+            saved = test.save(cfg.LIVE_TEST_PATH, tracking, stopped)
+        except OSError as e:   # e.g. the CSV is open in Excel, which locks it
             self._log(f"Couldn't save Live Test results: {e}")
         lines = [f"Live accuracy: {overall:.1%}" + ("  (stopped early)" if stopped else ""), "",
                  "Each frame counts as correct only if the model named the right pose with at least "
@@ -1513,7 +1521,9 @@ class KinesisApp(QMainWindow):
         if weak:
             lines += ["", f"Tip: record more of {', '.join(weak)} in today's conditions (+ in Gesture Mapping), "
                           "then Retrain."]
-        lines += ["", f"Saved to {os.path.basename(cfg.LIVE_TEST_PATH)} for your report."]
+        lines += ["", f"Saved as run {saved} in {os.path.basename(cfg.LIVE_TEST_PATH)}." if saved else
+                  f"Couldn't save to {os.path.basename(cfg.LIVE_TEST_PATH)} - is it open in Excel? Close it "
+                  "and run the test again to keep the results."]
         self._log(f"Live Test - accuracy {overall:.1%} ({note})")
         self.status_label.setText(f"Live Test finished: {overall:.1%}.")
         QMessageBox.information(self, "Live Test Results", "\n".join(lines))

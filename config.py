@@ -46,7 +46,8 @@ FRAMES_PER_RECORDING = 150
 # Training
 LIVE_TEST_READY = 2.5         # seconds of countdown before each pose in the Live Test
 LIVE_TEST_HOLD = 3.0          # seconds each pose is scored for
-LIVE_TEST_PATH = os.path.join(BASE_DIR, "live_test_results.csv")   # every Live Test run, for the report
+LIVE_TEST_PATH = os.path.join(BASE_DIR, "live_test_results.csv")   # Live Test results, for the report
+LIVE_TEST_KEEP_RUNS = 2       # only the newest runs are kept in that file (the latest and the one before)
 TEST_GAP_FRAMES = 15          # frames (~0.5 s) skipped between each gesture's training and test frames
 TRAIN_WITH_AUGMENTATION = False   # starting state of the "Train with data augmentation" checkbox
 
