@@ -190,7 +190,8 @@ class SelectGesturesDialog(QDialog):
         return [(item.text(), item.data(Qt.UserRole)) for item in self._items() if item.checkState() == Qt.Checked]
 
 class GestureMappingRow(QWidget):
-    def __init__(self, gesture, action, on_change, on_record_more, on_delete, on_rename=None, movement=False):
+    def __init__(self, gesture, action, on_change, on_record_more, on_delete, on_rename=None, movement=False,
+                 on_rerecord=None):
         super().__init__()
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
@@ -212,6 +213,9 @@ class GestureMappingRow(QWidget):
 
         icons = [("+", lambda: on_record_more(gesture), "iconBtn",
                   f"Record another '{gesture}' movement" if movement else f"Record more samples for '{gesture}'")]
+        if on_rerecord is not None:
+            icons.append(("↻", lambda: on_rerecord(gesture), "iconBtn",
+                          f"Re-record '{gesture}': record it again and replace the old recording"))
         if on_rename is not None:
             icons.append(("✎", lambda: on_rename(gesture), "iconBtn", f"Rename '{gesture}'"))
         icons.append(("✕", lambda: on_delete(gesture), "iconDeleteBtn", f"Delete '{gesture}'"))
@@ -227,16 +231,21 @@ class ConfusionMatrixDialog(QDialog):
         super().__init__(parent)
         n = len(class_names)
         self.setWindowTitle("Confusion Matrix")
-        self.resize(min(120 + 80 * n, 800), min(160 + 40 * n, 600))
+        self.resize(min(260 + 46 * n, 1100), min(170 + 34 * n, 760))
         layout = QVBoxLayout(self)
-        layout.addWidget(note("Rows = actual gesture, columns = predicted gesture. Diagonal = correct."))
+        layout.addWidget(note("Rows = the gesture you made, columns = what the model predicted (numbered like "
+                              "the rows - hover a number or a cell for the name). Diagonal = correct."))
 
         table = QTableWidget(n, n)
-        table.setHorizontalHeaderLabels(list(class_names))
-        table.setVerticalHeaderLabels(list(class_names))
+        table.setHorizontalHeaderLabels([str(i + 1) for i in range(n)])   # full names don't fit up here
+        table.setVerticalHeaderLabels([f"{i + 1}.  {name}" for i, name in enumerate(class_names)])
+        for j, name in enumerate(class_names):
+            table.horizontalHeaderItem(j).setToolTip(str(name))
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)   # no highlighted "current" cell
+        table.setFocusPolicy(Qt.NoFocus)
 
         row_max = matrix.max(axis=1, keepdims=True).clip(min=1)
         for i in range(n):
@@ -250,6 +259,7 @@ class ConfusionMatrixDialog(QDialog):
                     color = QColor(int(60 + strength * 150), int(60 - strength * 20), int(70 - strength * 20))
                 item.setBackground(color)
                 item.setForeground(QColor("#ffffff"))
+                item.setToolTip(f"made {class_names[i]}, predicted {class_names[j]}: {int(matrix[i, j])} frames")
                 table.setItem(i, j, item)
         layout.addWidget(table)
         layout.addWidget(button("Close", self.accept))

@@ -255,10 +255,24 @@ def load_trained_model():
     return model, encoder
 
 
+def time_split(df, test_share=0.2):
+    """Splits each gesture's frames by time: the first 80% (in recording order) for training, the newest 20%
+    for testing. A random split would put almost-identical neighbouring frames (1/30 s apart) on both
+    sides, so the test would be nearly a copy of the training data and always score ~100% (data leakage).
+    The last TEST_GAP_FRAMES training frames before the test block are left out, so the frames right at the
+    boundary (1/30 s apart) can't leak either. Gestures with fewer than 5 frames go entirely to training."""
+    train_parts, test_parts = [], []
+    for _, rows in df.groupby("label", sort=False):
+        n_test = int(round(len(rows) * test_share)) if len(rows) >= 5 else 0
+        gap = cfg.TEST_GAP_FRAMES if n_test and len(rows) - n_test > 2 * cfg.TEST_GAP_FRAMES else 0
+        train_parts.append(rows.iloc[:len(rows) - n_test - gap])
+        test_parts.append(rows.iloc[len(rows) - n_test:])
+    return pd.concat(train_parts), pd.concat(test_parts)
+
+
 def train_model(augment=True, progress=None):
     """Trains on the CSV and saves the model. Returns (model, encoder, held_out_accuracy, raw_rows, train_rows).
     Safe to run in a background thread. progress(fraction) is called after each epoch."""
-    from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import LabelEncoder
     from tensorflow import keras
     from tensorflow.keras import layers
@@ -273,10 +287,14 @@ def train_model(augment=True, progress=None):
     if counts.min() < 10:
         raise ValueError(f"'{counts.idxmin()}' has only {counts.min()} frames - record it again.")
 
-    X = df.drop("label", axis=1).values.astype(np.float32)
     encoder = LabelEncoder()
-    y = encoder.fit_transform(df["label"].values)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    encoder.fit(df["label"].values)
+    encoder.split_method = "time"   # remembered with the model, so Evaluate knows its test frames are unseen
+    train_df, test_df = time_split(df)
+    X_train = train_df.drop("label", axis=1).values.astype(np.float32)
+    X_test = test_df.drop("label", axis=1).values.astype(np.float32)
+    y_train = encoder.transform(train_df["label"].values)
+    y_test = encoder.transform(test_df["label"].values)
 
     raw_rows = len(X_train)
     if augment:
@@ -284,7 +302,7 @@ def train_model(augment=True, progress=None):
 
     # (no keras.backend.clear_session() here: the old model keeps recognising gestures while this trains)
     model = keras.Sequential([
-        layers.Input(shape=(X.shape[1],)),
+        layers.Input(shape=(X_train.shape[1],)),
         layers.Dense(64, activation="relu"),
         layers.Dense(32, activation="relu"),
         layers.Dense(len(encoder.classes_), activation="softmax"),

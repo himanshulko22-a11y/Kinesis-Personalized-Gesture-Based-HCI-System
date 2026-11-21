@@ -44,6 +44,10 @@ REPEAT_COOLDOWN = 0.3         # seconds between repeats of volume/scroll while h
 FRAMES_PER_RECORDING = 150
 
 # Training
+LIVE_TEST_READY = 2.5         # seconds of countdown before each pose in the Live Test
+LIVE_TEST_HOLD = 3.0          # seconds each pose is scored for
+LIVE_TEST_PATH = os.path.join(BASE_DIR, "live_test_results.csv")   # every Live Test run, for the report
+TEST_GAP_FRAMES = 15          # frames (~0.5 s) skipped between each gesture's training and test frames
 TRAIN_WITH_AUGMENTATION = False   # starting state of the "Train with data augmentation" checkbox
 
 # Similar-gesture warning (hand-shape distance, see gestures.similarity_warning)

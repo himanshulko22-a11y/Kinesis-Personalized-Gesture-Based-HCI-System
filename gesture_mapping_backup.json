@@ -4,6 +4,7 @@
   "fist": "drag",
   "four": "double_click",
   "ok_sign": "right_click",
+  "open_palm": "none",
   "peace": "screenshot",
   "pinch": "none",
   "pinky_up": "none",
@@ -24,6 +25,5 @@
   "swipe_up": "none",
   "tick": "none",
   "wave": "show_desktop",
-  "zigzag": "none",
-  "open_palm": "none"
+  "zigzag": "none"
 }

@@ -11,16 +11,16 @@ Files:
   movements.py dynamic gestures (movements) with DTW
   style.py     window theme
 """
+import json
 import os
 import shutil
 import sys
 import threading
 import time
 
-import json
-
 import cv2
 import mediapipe as mp
+import numpy as np
 import pandas as pd
 import pyautogui
 from PyQt5.QtCore import QRectF, Qt, QTimer, QUrl
@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
 
 import config as cfg
 import gestures as g
+import livetest as lt
 import actions
 import movements as mv
 from camera import Camera
@@ -107,6 +108,8 @@ class KinesisApp(QMainWindow):
         self.train_result = None
         self.removed_poses = set()          # deleted poses the current model still knows (ignored until retrain)
         self.last_deleted = None            # what the Undo link would bring back
+        self.live_test = None               # the Live Test in progress
+        self.replacing = None               # gesture being re-recorded: its old data goes when the new is saved
         for text in self.settings.get("shortcuts", []):
             try:
                 add_shortcut(text)   # before the mapping loads, so gestures can keep these actions
@@ -329,10 +332,17 @@ class KinesisApp(QMainWindow):
         for widget in (self.record_btn, tips_btn, self.train_btn):
             row.addWidget(widget)
         box.addLayout(row)
-        box.addWidget(button("Self-Test Accuracy", self.run_self_test,
-                             "Tests the model on a random slice of your data. Some of it was used in "
-                             "training, so treat it as a sanity check - live testing is the real test.",
+        row = QHBoxLayout()
+        row.addWidget(button("Evaluate Accuracy", self.run_self_test,
+                             "Tests the model on the newest 20% of each gesture's recordings - frames it "
+                             "never trained on - and shows accuracy per gesture and a confusion matrix.",
                              name="secondaryBtn"))
+        self.live_test_btn = button("Live Test", self.toggle_live_test,
+                                    "Kinesis asks for each pose in turn and scores fresh frames from the camera - "
+                                    "the real-world accuracy (today's light, position and hand).",
+                                    name="secondaryBtn")
+        row.addWidget(self.live_test_btn)
+        box.addLayout(row)
         self.record_label = QLabel("")   # recording progress and results
         self.record_label.setObjectName("statusLabel")
         self.record_label.setWordWrap(True)
@@ -343,9 +353,12 @@ class KinesisApp(QMainWindow):
         box.addWidget(self.warning_label)
         row = QHBoxLayout()
         self.save_btn = button("Save Gesture", self.save_recording)
+        self.save_more_btn = button("Save + Next Take", self.save_and_record_another,
+                                    "Saves this take and starts recording another take of the same gesture "
+                                    "straight away - no need to press + each time.")
         self.retake_btn = button("Retake", lambda: self._begin_recording(self.new_gesture_name), name="secondaryBtn")
         self.cancel_btn = button("Cancel", self.cancel_recording, name="deleteBtn")
-        for widget in (self.save_btn, self.retake_btn, self.cancel_btn):
+        for widget in (self.save_btn, self.save_more_btn, self.retake_btn, self.cancel_btn):
             row.addWidget(widget)
         box.addLayout(row)
 
@@ -598,7 +611,7 @@ class KinesisApp(QMainWindow):
             self.mapping_layout.addWidget(GestureMappingRow(
                 gesture, self.gesture_mapping.get(gesture, "none"),
                 self.on_mapping_changed, lambda name: self._begin_recording(name, "pose"), self.delete_gesture,
-                on_rename=self.rename_gesture))
+                on_rename=self.rename_gesture, on_rerecord=lambda name: self.rerecord(name, "pose")))
         if moves:
             self.mapping_layout.addWidget(self._group_label(
                 f"MOVEMENTS  ·  {len(moves)}" + ("  ·  open hand" if cfg.MOVEMENT_NEEDS_OPEN_HAND else "")))
@@ -606,7 +619,8 @@ class KinesisApp(QMainWindow):
             self.mapping_layout.addWidget(GestureMappingRow(
                 name, self.gesture_mapping.get(name, "none"), self.on_mapping_changed,
                 lambda n: self._begin_recording(n, "movement"), self.delete_movement,
-                on_rename=lambda n: self.rename_gesture(n, movement=True), movement=True))
+                on_rename=lambda n: self.rename_gesture(n, movement=True), movement=True,
+                on_rerecord=lambda n: self.rerecord(n, "movement")))
 
     @staticmethod
     def _group_label(text):
@@ -739,6 +753,7 @@ class KinesisApp(QMainWindow):
         busy = self.mode in ("recording", "reviewing")
         self.record_btn.setEnabled(not busy)
         self.save_btn.setVisible(self.mode == "reviewing")
+        self.save_more_btn.setVisible(self.mode == "reviewing")
         self.retake_btn.setVisible(busy)
         self.cancel_btn.setVisible(busy)
 
@@ -805,8 +820,13 @@ class KinesisApp(QMainWindow):
 
     def _begin_recording(self, name, kind=None):
         kind = kind or self.record_kind
+        if self.mode == "livetest":
+            QMessageBox.information(self, "Live Test running", "Stop the Live Test first, then record.")
+            return
         if self.mode in ("recording", "reviewing") and name != self.new_gesture_name:
             return   # finish or cancel the current recording first
+        if self.replacing is not None and name != self.replacing:
+            self.replacing = None   # started recording something else: no longer re-recording
         self.new_gesture_name = name
         self.record_kind = kind
         self.recording_buffer = []
@@ -918,12 +938,51 @@ class KinesisApp(QMainWindow):
             self._log(f"Similarity check for '{self.new_gesture_name}': {message}")
         self.warning_label.show()
 
+    def rerecord(self, name, kind):
+        """Records a gesture again; when the new take is saved, the old recordings are replaced
+        (they go to the trash, so they can still be restored)."""
+        if self.mode != "normal":
+            QMessageBox.information(self, "Busy", "Finish or cancel what's running first.")
+            return
+        if kind == "pose" and self._busy_training():
+            return
+        more = ("Then add 2-3 more takes with + (switch hands between takes), and click Retrain Model."
+                if kind == "pose" else "Then add 3-4 more takes with + so it's recognised reliably.")
+        if not ask(self, "Re-record?", f"Record '{name}' again from scratch?\n\nWhen you click Save Gesture, the "
+                   f"new take replaces all old recordings of '{name}'. {more}\n\nThe old recordings go to the "
+                   "trash (Danger Zone → Restore Deleted Gestures). Cancel the recording to keep them."):
+            return
+        self.replacing = name
+        self._begin_recording(name, kind)
+        self.record_label.setText(f"Re-recording '{name}' - the old recordings are replaced when you Save.")
+
+    def _replace_old(self, name, kind):
+        """On the first Save of a re-recording: moves the gesture's old data to the trash."""
+        if self.replacing != name:
+            return False
+        self.replacing = None
+        if kind == "pose":
+            df = g.read_dataset()
+            if df is not None:
+                old = df["label"] == name
+                self._append_trash_rows(df[old])
+                df[~old].to_csv(cfg.CSV_PATH, index=False)
+        else:
+            trash = self._load_movement_trash()
+            trash += [{"label": label, "path": [list(p) for p in path], "deleted_at": time.time()}
+                      for label, path in self.movements.samples if label == name]
+            self._save_movement_trash(trash)
+            self.movements.remove(name)
+        self._log(f"Re-recorded '{name}': old recordings moved to the trash")
+        return True
+
     def save_recording(self):
         if self.record_kind == "movement":
             self._save_movement()
             return
         if self._busy_training():
             return   # the recording stays waiting for Save
+        replaced = self._replace_old(self.new_gesture_name, "pose")
         g.append_recording(self.new_gesture_name, self.recording_buffer)
         count = len(self.recording_buffer)
         self.recording_buffer = []
@@ -931,12 +990,22 @@ class KinesisApp(QMainWindow):
         self._set_recording_buttons()
         self.warning_label.hide()
         self._refresh_dataset_info()
-        self.record_label.setText(f"Saved {count} frames for '{self.new_gesture_name}'. "
-                                  f"Record more takes for variety, or Retrain Model when ready.")
+        self.record_label.setText(
+            f"Replaced '{self.new_gesture_name}' with the new take ({count} frames). Add 2-3 more takes with + "
+            f"(switch hands between them), then Retrain Model." if replaced else
+            f"Saved {count} frames for '{self.new_gesture_name}'. "
+            f"Record more takes for variety, or Retrain Model when ready.")
         self._log(f"Recorded {count} frames for '{self.new_gesture_name}'")
+
+    def save_and_record_another(self):
+        name, kind = self.new_gesture_name, self.record_kind
+        self.save_recording()
+        if self.mode == "normal":   # saved (it stays in review if saving had to wait, e.g. during training)
+            self._begin_recording(name, kind)
 
     def _save_movement(self):
         name = self.new_gesture_name
+        replaced = self._replace_old(name, "movement")
         self.movements.add(name, self.recorded_path)
         self.recorded_path = None
         self.mode = "normal"
@@ -946,12 +1015,14 @@ class KinesisApp(QMainWindow):
         self._refresh_mapping_rows()
         self._refresh_dataset_info()
         count = self.movements.counts().get(name, 0)
-        self.record_label.setText(f"Saved movement {count} of '{name}'. "
+        self.record_label.setText((f"Replaced '{name}' with the new take. " if replaced else
+                                   f"Saved movement {count} of '{name}'. ")
                                   + ("Record 4-5 in total (press + next to it)." if count < 4 else
                                      "It works straight away - pick an action for it in Gesture Mapping."))
         self._log(f"Recorded movement '{name}' ({count} total)")
 
     def cancel_recording(self):
+        self.replacing = None   # a cancelled re-recording keeps the old recordings
         self.recorded_path = None
         self.recording_buffer = []
         self.mode = "normal"
@@ -1140,7 +1211,7 @@ class KinesisApp(QMainWindow):
         frames = f"{raw} frames -> {used} after augmentation" if used != raw else f"{raw} frames"
         message = self.train_done_message
         self.status_label.setText(f"{message} {len(self.encoder.classes_)} gestures, {frames}, "
-                                  f"test accuracy {accuracy:.0%} (often optimistic - trust live testing).")
+                                  f"accuracy on unseen frames {accuracy:.0%}.")
         self._log(f"{message} test accuracy {accuracy:.1%}, {frames}")
 
     def _busy_training(self):
@@ -1169,7 +1240,8 @@ class KinesisApp(QMainWindow):
         if not ask(self, "Balance dataset?", f"Trim every gesture down to {smallest} frames? "
                                              f"Extra frames are permanently deleted."):
             return
-        balanced = df.groupby("label").sample(n=smallest, random_state=42)
+        # .sort_index(): keep recording order, which the honest (time-based) test split relies on
+        balanced = df.groupby("label").sample(n=smallest, random_state=42).sort_index()
         pd.concat([balanced, mistakes]).to_csv(cfg.CSV_PATH, index=False)
         self._retrain(f"Balanced to {smallest} frames per gesture and retrained.")
 
@@ -1351,39 +1423,151 @@ class KinesisApp(QMainWindow):
         self.status_label.setText(f"Restored {names}." + (
             f" Click Retrain Model to use {', '.join(needs_retrain)} again." if needs_retrain else ""))
 
+    # ---------- Live test ----------
+
+    def toggle_live_test(self):
+        if self.mode == "livetest":
+            self._finish_live_test(stopped=True)
+            return
+        if self.model is None:
+            QMessageBox.warning(self, "No model", "Record at least 2 poses and Retrain Model first.")
+            return
+        if self.mode != "normal":
+            QMessageBox.information(self, "Busy", "Finish recording (or unlock) first, then start the Live Test.")
+            return
+        poses = [str(p) for p in self.encoder.classes_ if p != g.NONE_LABEL and p not in self.removed_poses]
+        seconds = round(len(poses) * (cfg.LIVE_TEST_READY + cfg.LIVE_TEST_HOLD))
+        if not ask(self, "Live Test", f"Kinesis will ask for each of your {len(poses)} poses in a random order.\n\n"
+                   f"When you see 'Make: <pose>', make it with ONE hand and hold it until the next one "
+                   f"(about {cfg.LIVE_TEST_HOLD:.0f} s each). Move your hand a little - closer, further, "
+                   f"slightly turned - like in real use.\n\nNo actions run during the test and nothing is "
+                   f"saved as training data. Takes about {seconds // 60} min {seconds % 60} s.\n\nStart?"):
+            return
+        self.live_test = lt.LiveTest(poses, self.confidence_threshold)
+        self._release_all_buttons()
+        self._clear_prediction_state()
+        self.mode = "livetest"
+        self.live_test_btn.setText("Stop Live Test")
+        self.status_label.setText("Live Test running - follow the instructions on the video.")
+        self._log(f"Live Test started ({len(poses)} poses)")
+
+    def _update_live_test(self, hands, frame, now):
+        test = self.live_test
+        prediction = None
+        for _, landmarks in hands:   # if two hands show, score the one the model is surest about
+            pose, confidence = g.predict(self.model, self.encoder, landmarks)
+            if pose in self.removed_poses:
+                pose, confidence = lt.UNSURE, 0.0
+            if prediction is None or confidence > prediction[1]:
+                prediction = (pose, confidence)
+        test.update(now, prediction)
+        if test.finished:
+            self._finish_live_test()
+            return
+        self._draw_live_test(frame, test, now)
+
+    def _draw_live_test(self, frame, test, now):
+        h, w = frame.shape[:2]
+        band = frame[0:70, :]
+        band[:] = (band * 0.3).astype(band.dtype)
+        cv2.putText(frame, f"Make: {test.target}", (16, 46), cv2.FONT_HERSHEY_SIMPLEX, 1.3,
+                    (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(frame, f"{test.step + 1}/{len(test.poses)}", (w - 90, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (201, 168, 255), 2, cv2.LINE_AA)
+        left = test.seconds_left(now)
+        if test.phase == "ready":
+            self._draw_big_text(frame, str(int(left) + 1))
+            return
+        done = 1 - left / cfg.LIVE_TEST_HOLD   # progress bar while the pose is being scored
+        cv2.rectangle(frame, (0, h - 10), (int(w * done), h), (120, 255, 160), -1)
+        guess = test.current_guess
+        if guess is not None:
+            color = (120, 255, 160) if guess == test.target else (90, 120, 255)
+            cv2.putText(frame, f"sees: {guess}", (16, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+
+    def _finish_live_test(self, stopped=False):
+        test, self.live_test = self.live_test, None
+        self.mode = "normal"
+        self.live_test_btn.setText("Live Test")
+        self._clear_prediction_state()
+        self.last_activity_time = time.time()
+        overall = test.overall()
+        if overall is None:
+            self.status_label.setText("Live Test stopped - no poses were scored.")
+            return
+        note = ("lite tracking" if self.lite_tracking else "full tracking") + (", stopped early" if stopped else "")
+        try:
+            test.save(cfg.LIVE_TEST_PATH, note)
+        except OSError as e:
+            self._log(f"Couldn't save Live Test results: {e}")
+        lines = [f"Live accuracy: {overall:.1%}" + ("  (stopped early)" if stopped else ""), "",
+                 "Each frame counts as correct only if the model named the right pose with at least "
+                 f"{self.confidence_threshold:.0%} confidence - exactly when it would act in real use.", ""]
+        for accuracy, pose, _, wrong, share in test.results():
+            if accuracy is None:
+                lines.append(f"     -     {pose}  (no hand seen)")
+            else:
+                confused = f"  - mistaken for {wrong} {share:.0%}" if wrong and share >= 0.05 else ""
+                lines.append(f"  {accuracy:6.1%}   {pose}{confused}")
+        weak = [pose for accuracy, pose, _, _, _ in test.results() if accuracy is not None and accuracy < 0.8]
+        if weak:
+            lines += ["", f"Tip: record more of {', '.join(weak)} in today's conditions (+ in Gesture Mapping), "
+                          "then Retrain."]
+        lines += ["", f"Saved to {os.path.basename(cfg.LIVE_TEST_PATH)} for your report."]
+        self._log(f"Live Test - accuracy {overall:.1%} ({note})")
+        self.status_label.setText(f"Live Test finished: {overall:.1%}.")
+        QMessageBox.information(self, "Live Test Results", "\n".join(lines))
+        names, grid = test.matrix()
+        ConfusionMatrixDialog(names, np.array(grid), parent=self).exec_()
+
     def run_self_test(self):
+        """Honest accuracy: tests the model on the newest 20% of each pose's recordings - frames it never
+        trained on (see gestures.time_split for why a random split would score a misleading ~100%)."""
         if self.model is None:
             QMessageBox.warning(self, "No model", "Record at least 2 gestures and Retrain Model first.")
+            return
+        if getattr(self.encoder, "split_method", "random") != "time":
+            QMessageBox.information(self, "Retrain first",
+                                    "This model was trained before the honest test split was added, so some "
+                                    "test frames were used in training and the score would be too high.\n\n"
+                                    "Click Retrain Model once, then Evaluate again.")
             return
         df = g.read_dataset()
         if df is None:
             QMessageBox.warning(self, "No data", "No gesture data recorded yet.")
             return
         from sklearn.metrics import confusion_matrix
-        from sklearn.model_selection import train_test_split
         index = {name: i for i, name in enumerate(self.encoder.classes_)}
         untrained = sorted(set(df["label"]) - set(index) - {g.NONE_LABEL})
-        if untrained:
-            QMessageBox.information(self, "Not trained yet", f"Not in the model yet: {', '.join(untrained)}.\n"
-                                    "They're left out of this test - click Retrain Model to include them.")
-        df = df[df["label"].isin(index)]   # skip anything the model wasn't trained on (e.g. few mistakes)
-        try:
-            y = df["label"].map(index).values
-            _, X_test, _, y_test = train_test_split(df.drop("label", axis=1).values, y,
-                                                    test_size=0.2, stratify=y)
-        except ValueError:
-            QMessageBox.warning(self, "Model out of date",
-                                "Your data has changed since the last training. Click Retrain Model first.")
+        df = df[df["label"].isin(index) & ~df["label"].isin(self.removed_poses)]
+        _, test = g.time_split(df)
+        if test.empty:
+            QMessageBox.warning(self, "Not enough data", "Record more frames per gesture first.")
             return
-
+        X_test = test.drop("label", axis=1).values.astype("float32")
+        y_test = test["label"].map(index).values
         predicted = self.model.predict(X_test, verbose=0).argmax(axis=1)
-        lines = [f"Overall accuracy: {(predicted == y_test).mean():.1%}  ({len(y_test)} samples)", ""]
-        for i, name in enumerate(self.encoder.classes_):
+        overall = (predicted == y_test).mean()
+
+        scores = []
+        for name, i in index.items():
             mask = y_test == i
             if mask.any():
-                lines.append(f"  {name}: {(predicted[mask] == i).mean():.1%}  ({mask.sum()} samples)")
-        self._log(f"Self-test - overall accuracy {(predicted == y_test).mean():.1%}")
-        QMessageBox.information(self, "Self-Test Results", "\n".join(lines))
+                scores.append(((predicted[mask] == i).mean(), name, int(mask.sum())))
+        scores.sort()   # weakest first: those are the ones to re-record
+        lines = [f"Accuracy on unseen frames: {overall:.1%}", "",
+                 f"Tested on the newest 20% of each gesture's recordings ({len(y_test)} frames). The model "
+                 "never trained on these, so this is an honest score. Live use can still be a little lower "
+                 "(different light, angle or distance).", ""]
+        lines += [f"  {acc:6.1%}   {'not a gesture' if name == g.NONE_LABEL else name}  ({n} frames)"
+                  for acc, name, n in scores]
+        weakest = [name for acc, name, _ in scores if acc < 0.9 and name != g.NONE_LABEL]
+        if weakest:
+            lines += ["", f"Tip: record more of {', '.join(weakest)} (use + in Gesture Mapping), then Retrain."]
+        if untrained:
+            lines += ["", f"Not in the model yet (left out): {', '.join(untrained)} - Retrain to include them."]
+        self._log(f"Evaluate - accuracy on unseen frames {overall:.1%} ({len(y_test)} frames)")
+        QMessageBox.information(self, "Evaluation Results", "\n".join(lines))
         matrix = confusion_matrix(y_test, predicted, labels=range(len(self.encoder.classes_)))
         ConfusionMatrixDialog(self.encoder.classes_, matrix, parent=self).exec_()
 
@@ -1490,7 +1674,7 @@ class KinesisApp(QMainWindow):
         t1 = time.perf_counter()
 
         now = time.time()
-        if now - self.last_frame_time > 2.0 or self.paused or self.mode in ("recording", "reviewing"):
+        if now - self.last_frame_time > 2.0 or self.paused or self.mode in ("recording", "reviewing", "livetest"):
             self.last_activity_time = now   # don't count pauses, training or recording as idle time
         self.last_frame_time = now
 
@@ -1500,6 +1684,8 @@ class KinesisApp(QMainWindow):
             self._record_frame(hands)
         elif self.mode == "reviewing" and self.recorded_path:
             self._draw_path(frame, self.recorded_path, (120, 255, 160))
+        elif self.mode == "livetest":
+            self._update_live_test(hands, frame, now)
         elif self.mode == "locked":
             self._update_locked(hands)
         elif self.mode == "normal":
@@ -1553,6 +1739,8 @@ class KinesisApp(QMainWindow):
             state, text = "rec", "●  REC"
         elif self.mode == "reviewing":
             state, text = "review", "REVIEW"
+        elif self.mode == "livetest":
+            state, text = "review", "LIVE TEST"
         elif self.mode == "locked":
             state, text = "locked", "LOCKED"
         elif self.paused:

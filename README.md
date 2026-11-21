@@ -22,7 +22,9 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 - **Learning from mistakes:** if a gesture fires by accident, mark it within 5 seconds (button, the mistake hotkey - **Z** by default, changeable in the app - or a gesture mapped to *Mark Last Action as Mistake*). That hand shape is saved as "not a gesture", and the model learns not to fire on it at the next retrain.
 - **Speed readout:** camera FPS, app FPS and time per step, shown on the video.
 - **Activity log:** see what the app did and when, including why a movement was ignored.
+- **Honest evaluation:** *Evaluate Accuracy* tests on the newest 20% of each pose's recordings (a time-based split - a random split leaks near-identical neighbouring frames). *Live Test* asks for each pose in turn and scores fresh camera frames, saving results to `live_test_results.csv` for comparison across runs or users.
 - **Background training:** Retrain runs in a separate thread, so the camera and gestures keep working (with the old model) and the window never freezes; the new model swaps in when it's ready.
+- **Re-record:** the ↻ button next to a gesture records it again from scratch; the old recordings are replaced (and kept in the trash) when you save the new take.
 - **Instant delete with undo:** deleting poses or movements (one at a time or several at once) is instant - deleted poses are ignored until you next retrain. Deleted gestures go to a trash file: **Undo** right after, or **Restore Deleted Gestures** later. The trash keeps them for 30 days (then they're removed automatically), or click **Empty Trash** to remove them now.
 - **Faster tracking option:** switch MediaPipe to its lite hand model for a higher frame rate.
 - **Collapsible panel:** every section of the side panel can be opened or closed (or all at once), and the app remembers your choice.
