@@ -4,9 +4,7 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 
 ## Screenshots
 
-<img width="960" height="507" alt="123" src="https://github.com/user-attachments/assets/f7f543c7-1d98-4944-a111-887d6b0e4377" />
-
-<img width="960" height="506" alt="321" src="https://github.com/user-attachments/assets/14579d4a-c012-4320-ac4b-a974fe147fe9" />
+<img width="1920" height="1080" alt="screenshot_20261121_172704" src="https://github.com/user-attachments/assets/f4097a24-9e54-4164-a79a-ad57573208fd" />
 
 ## Features
 
