@@ -227,10 +227,10 @@ class GestureMappingRow(QWidget):
 
 
 class ConfusionMatrixDialog(QDialog):
-    def __init__(self, class_names, matrix, parent=None):
+    def __init__(self, class_names, matrix, parent=None, unit="frames", title="Confusion Matrix"):
         super().__init__(parent)
         n = len(class_names)
-        self.setWindowTitle("Confusion Matrix")
+        self.setWindowTitle(title)
         self.resize(min(260 + 46 * n, 1100), min(170 + 34 * n, 760))
         layout = QVBoxLayout(self)
         layout.addWidget(note("Rows = the gesture you made, columns = what the model predicted (numbered like "
@@ -259,7 +259,7 @@ class ConfusionMatrixDialog(QDialog):
                     color = QColor(int(60 + strength * 150), int(60 - strength * 20), int(70 - strength * 20))
                 item.setBackground(color)
                 item.setForeground(QColor("#ffffff"))
-                item.setToolTip(f"made {class_names[i]}, predicted {class_names[j]}: {int(matrix[i, j])} frames")
+                item.setToolTip(f"made {class_names[i]}, predicted {class_names[j]}: {int(matrix[i, j])} {unit}")
                 table.setItem(i, j, item)
         layout.addWidget(table)
         layout.addWidget(button("Close", self.accept))

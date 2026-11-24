@@ -93,6 +93,14 @@ MOVE_REJECT_DEFAULT = 0.35    # used until each movement has 2+ recordings
 MOVE_COUNTDOWN = 3            # seconds before a movement recording starts
 MOVE_RECORD_TIMEOUT = 8       # seconds to wait for a movement after the countdown
 
+# Movement Live Test (see movetest.py)
+MOVE_TEST_REPS = 10           # default number of attempts per movement (you can change it when starting)
+MOVE_TEST_READY = 2.0         # seconds of countdown before each attempt (keep the hand still)
+MOVE_TEST_TIMEOUT = 6.0       # seconds to make the movement after GO, then it counts as "not detected"
+MOVE_TEST_SHOW = 1.2          # seconds each attempt's result stays on screen
+MOVE_TEST_PATH = os.path.join(BASE_DIR, "movement_live_test_results.csv")   # Movement Test results, for the report
+MOVE_TEST_KEEP_RUNS = 2       # only the newest runs are kept in that file
+
 # Actions
 VOLUME_PRESSES = 3
 BRIGHTNESS_STEP = 5           # percent per step; keeps repeating while the gesture is held (like volume)

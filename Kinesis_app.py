@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
 import config as cfg
 import gestures as g
 import livetest as lt
+import movetest as mt
 import actions
 import movements as mv
 from camera import Camera
@@ -107,6 +108,7 @@ class KinesisApp(QMainWindow):
         self.removed_poses = set()          # deleted poses the current model still knows (ignored until retrain)
         self.last_deleted = None            # what the Undo link would bring back
         self.live_test = None               # the Live Test in progress
+        self.move_test = None               # the Movement Test in progress (also uses mode "livetest")
         self.replacing = None               # gesture being re-recorded: its old data goes when the new is saved
         for text in self.settings.get("shortcuts", []):
             try:
@@ -353,7 +355,9 @@ class KinesisApp(QMainWindow):
         box.addWidget(note("Evaluate Accuracy checks the model on recorded frames it never trained on (quick). "
                            "Live Test asks for each pose and scores fresh camera frames - the real-world "
                            "accuracy. Live Test results are saved to "
-                           f"{os.path.basename(cfg.LIVE_TEST_PATH)} (the last {cfg.LIVE_TEST_KEEP_RUNS} runs)."))
+                           f"{os.path.basename(cfg.LIVE_TEST_PATH)} (the last {cfg.LIVE_TEST_KEEP_RUNS} runs). "
+                           "Movement Test does the same for movements: it asks for each one several times and "
+                           f"saves the results to {os.path.basename(cfg.MOVE_TEST_PATH)}."))
         row = QHBoxLayout()
         row.addWidget(button("Evaluate Accuracy", self.run_self_test,
                              "Tests the model on the newest 20% of each gesture's recordings - frames it "
@@ -365,6 +369,11 @@ class KinesisApp(QMainWindow):
                                     name="secondaryBtn")
         row.addWidget(self.live_test_btn)
         box.addLayout(row)
+        self.move_test_btn = button("Movement Test", self.toggle_move_test,
+                                    "Live Test for movements: Kinesis asks for each recorded movement several "
+                                    "times and logs each attempt as correct, wrong movement, or rejected. "
+                                    "Attempts are not saved as recordings.", name="secondaryBtn")
+        box.addWidget(self.move_test_btn)
 
         box = self._section(col, "Sensitivity", False)
         self._add_slider(box, "Confidence Threshold", 50, 95, int(self.confidence_threshold * 100),
@@ -1430,6 +1439,9 @@ class KinesisApp(QMainWindow):
     # ---------- Live test ----------
 
     def toggle_live_test(self):
+        if self.move_test is not None:
+            QMessageBox.information(self, "Movement Test running", "Stop the Movement Test first.")
+            return
         if self.mode == "livetest":
             self._finish_live_test(stopped=True)
             return
@@ -1527,6 +1539,150 @@ class KinesisApp(QMainWindow):
         QMessageBox.information(self, "Live Test Results", "\n".join(lines))
         names, grid = test.matrix()
         ConfusionMatrixDialog(names, np.array(grid), parent=self).exec_()
+
+    # ---------- Movement live test ----------
+
+    def toggle_move_test(self):
+        if self.move_test is not None:
+            self._finish_move_test(stopped=True)
+            return
+        if self.mode == "livetest":
+            QMessageBox.information(self, "Live Test running", "Stop the pose Live Test first.")
+            return
+        if self.mode != "normal":
+            QMessageBox.information(self, "Busy", "Finish recording (or unlock) first, then start the Movement Test.")
+            return
+        counts = self.movements.counts()
+        names = self.movements.labels()
+        if not names:
+            QMessageBox.warning(self, "No movements", "Record at least one movement first (Add New Gesture).")
+            return
+        few = [n for n in names if counts.get(n, 0) < 2]
+        per_attempt = cfg.MOVE_TEST_READY + 2.5 + cfg.MOVE_TEST_SHOW   # countdown + a typical movement + result
+        reps, ok = QInputDialog.getInt(
+            self, "Movement Test",
+            f"Kinesis will ask for each of your {len(names)} movements, in a random order, again and again.\n\n"
+            "For every attempt: keep your OPEN hand still during the countdown, make the movement when you see "
+            "GO, then hold still. Each attempt is logged as correct, wrong movement, or rejected.\n\n"
+            "No actions run and nothing is saved as a recording, so the test can't learn from itself."
+            + (f"\n\nNote: {', '.join(few)} {'has' if len(few) == 1 else 'have'} fewer than 2 recordings."
+               if few else "")
+            + f"\n\nAttempts per movement (each round of {len(names)} takes about "
+              f"{per_attempt * len(names) / 60:.1f} min; {cfg.MOVE_TEST_REPS} rounds = about "
+              f"{per_attempt * len(names) * cfg.MOVE_TEST_REPS / 60:.0f} min):",
+            cfg.MOVE_TEST_REPS, 1, 30)
+        if not ok:
+            return
+        self.move_test = mt.MovementLiveTest(self.movements, names, reps)
+        self._release_all_buttons()
+        self._clear_prediction_state()
+        self.last_fired = None   # so the mistake hotkey can't save anything during the test
+        self.mode = "livetest"
+        self.move_test_btn.setText("Stop Movement Test")
+        self.status_label.setText("Movement Test running - follow the instructions on the video.")
+        self._log(f"Movement Test started ({len(names)} movements x {reps} attempts)")
+
+    def _update_move_test(self, hands, frame, now):
+        test = self.move_test
+        before = len(test.attempts)
+        test.update(now, hands)
+        if len(test.attempts) > before:
+            a = test.last
+            seen = f" as '{a['seen_as']}'" if a["seen_as"] else ""
+            dist = f", DTW {a['distance']:.3f}" if a["distance"] is not None else ""
+            why = f" - {a['reason']}" if a["reason"] else ""
+            self._log(f"Movement Test {a['number']}/{len(test.schedule)}: asked '{a['asked']}' -> "
+                      f"{a['result']}{seen}{dist}{why}")
+        if test.finished:
+            self._finish_move_test()
+            return
+        self._draw_move_test(frame, test, now)
+
+    def _draw_move_test(self, frame, test, now):
+        h, w = frame.shape[:2]
+        band = frame[0:70, :]
+        band[:] = (band * 0.3).astype(band.dtype)
+        cv2.putText(frame, f"Move: {test.target}", (16, 46), cv2.FONT_HERSHEY_SIMPLEX, 1.3,
+                    (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(frame, f"{test.step + 1}/{len(test.schedule)}", (w - 130, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (201, 168, 255), 2, cv2.LINE_AA)
+        left = test.seconds_left(now)
+        if test.phase == "ready":
+            self._draw_big_text(frame, str(int(left) + 1))
+            return
+        if test.phase == "go":
+            capture = test.capture()
+            if capture:
+                self._draw_path(frame, capture, (60, 170, 255), taper=True)
+            if now - test.phase_start < 0.6:
+                self._draw_big_text(frame, "GO")
+            cv2.rectangle(frame, (0, h - 10), (int(w * left / cfg.MOVE_TEST_TIMEOUT), h), (255, 200, 120), -1)
+            if test.hint:
+                cv2.putText(frame, test.hint, (16, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (90, 180, 255), 2,
+                            cv2.LINE_AA)
+            return
+        a = test.last   # "result": show what this attempt was scored as
+        if a["path"]:
+            color = {mt.CORRECT: (120, 255, 160), mt.WRONG: (90, 120, 255)}.get(a["result"], (170, 170, 170))
+            self._draw_path(frame, a["path"], color, taper=True)
+        text, color = {mt.CORRECT: ("correct", (120, 255, 160)),
+                       mt.WRONG: (f"wrong - seen as {a['seen_as']}", (90, 120, 255)),
+                       mt.REJECTED: ("rejected (not recognised)", (90, 180, 255)),
+                       mt.MISSED: ("no movement seen", (170, 170, 170))}[a["result"]]
+        cv2.putText(frame, text, (16, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+
+    def _finish_move_test(self, stopped=False):
+        test, self.move_test = self.move_test, None
+        self.mode = "normal"
+        self.move_test_btn.setText("Movement Test")
+        self._clear_prediction_state()
+        self.last_activity_time = time.time()
+        overall = test.overall()
+        if overall is None:
+            self.status_label.setText("Movement Test stopped - no attempts were scored.")
+            return
+        tracking = "lite" if self.lite_tracking else "full"
+        saved = None
+        try:
+            saved = test.save(cfg.MOVE_TEST_PATH, tracking, stopped)
+        except OSError as e:   # e.g. the CSV is open in Excel, which locks it
+            self._log(f"Couldn't save Movement Test results: {e}")
+        c, n = test.counts(), len(test.attempts)
+        lines = [f"Movement accuracy: {overall:.1%}  ({c[mt.CORRECT]} of {n} attempts)"
+                 + ("  (stopped early)" if stopped else ""),
+                 f"Wrong movement: {c[mt.WRONG]} ({test.rate(mt.WRONG):.1%})   "
+                 f"Rejected: {c[mt.REJECTED]} ({test.rate(mt.REJECTED):.1%})   "
+                 f"Not detected: {c[mt.MISSED]} ({test.rate(mt.MISSED):.1%})", "",
+                 "Correct = recognised as the movement asked for, exactly as in real use. Rejected = Kinesis "
+                 f"refused to name it (DTW reject limit {self.movements.threshold:.3f}), so nothing would happen.", ""]
+        for accuracy, name, count, cs, wrong, times in test.results():
+            if accuracy is None:
+                lines.append(f"     -     {name}  (not tested)")
+                continue
+            extra = []
+            if wrong:
+                extra.append(f"mistaken for {wrong} {times}x")
+            if cs[mt.REJECTED]:
+                extra.append(f"rejected {cs[mt.REJECTED]}x")
+            if cs[mt.MISSED]:
+                extra.append(f"not detected {cs[mt.MISSED]}x")
+            lines.append(f"  {accuracy:6.1%}   {name}  ({cs[mt.CORRECT]}/{count})"
+                         + (f"  - {', '.join(extra)}" if extra else ""))
+        weak = [name for accuracy, name, *_ in test.results() if accuracy is not None and accuracy < 0.8]
+        if weak:
+            lines += ["", f"Tip: add 2-3 more recordings of {', '.join(weak)} (+ in Gesture Mapping), "
+                          "or make it more different from the movement it's confused with."]
+        lines += ["", f"Saved as run {saved} in {os.path.basename(cfg.MOVE_TEST_PATH)} (every attempt is "
+                      "also in the activity log)." if saved else
+                  f"Couldn't save to {os.path.basename(cfg.MOVE_TEST_PATH)} - is it open in Excel? Close it "
+                  "and run the test again to keep the results."]
+        self._log(f"Movement Test - accuracy {overall:.1%}, rejected {test.rate(mt.REJECTED):.1%} "
+                  f"({n} attempts, {tracking} tracking{', stopped early' if stopped else ''})")
+        self.status_label.setText(f"Movement Test finished: {overall:.1%}.")
+        QMessageBox.information(self, "Movement Test Results", "\n".join(lines))
+        names, grid = test.matrix()
+        ConfusionMatrixDialog(names, np.array(grid), parent=self, unit="attempts",
+                              title="Movement Confusion Matrix").exec_()
 
     def run_self_test(self):
         """Honest accuracy: tests the model on the newest 20% of each pose's recordings - frames it never
@@ -1692,6 +1848,8 @@ class KinesisApp(QMainWindow):
             self._record_frame(hands)
         elif self.mode == "reviewing" and self.recorded_path:
             self._draw_path(frame, self.recorded_path, (120, 255, 160))
+        elif self.mode == "livetest" and self.move_test is not None:
+            self._update_move_test(hands, frame, now)
         elif self.mode == "livetest":
             self._update_live_test(hands, frame, now)
         elif self.mode == "locked":
