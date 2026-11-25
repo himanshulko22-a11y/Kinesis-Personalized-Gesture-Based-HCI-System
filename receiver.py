@@ -16,6 +16,7 @@ hotspot is set as a public network), then click Allow.
 """
 import os
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -55,16 +56,114 @@ def _screenshot():
     pyautogui.screenshot(os.path.join(SCREENSHOT_DIR, time.strftime("screenshot_%Y%m%d_%H%M%S.png")))
 
 
-def _brightness(step):
-    """Laptop screen brightness, via Windows' own setting (same idea as Kinesis' actions.py)."""
-    if sys.platform != "win32":
-        raise RuntimeError("brightness only works on Windows")
-    command = ("$m = Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness | Select-Object -First 1; "
-               f"$level = [Math]::Max(0, [Math]::Min(100, $m.CurrentBrightness + ({step}))); "
-               "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods | Select-Object -First 1)"
-               ".WmiSetBrightness(1, $level) | Out-Null")
-    subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                     creationflags=0x08000000)   # in the background, no console window
+class Brightness:
+    """Screen brightness up/down on Windows, Linux and macOS. Each system has its own way, so the
+    first one that works is used (and remembered). If none works, the error explains what to install."""
+
+    def __init__(self):
+        self.lock = threading.Lock()   # two quick gestures must not change the level at the same time
+        self.method = None             # the way that worked last time
+        self.failed = set()            # ways that didn't work on this PC (not tried again)
+        self.xrandr_level = None       # Linux software dimming: the level we set (1.0 = normal)
+
+    def change(self, step):
+        """step = percent, e.g. +5 or -5. Raises RuntimeError with a clear message if nothing works."""
+        with self.lock:
+            if sys.platform == "win32":
+                ways = [self._windows]
+            elif sys.platform == "darwin":
+                ways = [self._mac_cli, self._mac_keys]
+            else:
+                ways = [self._brightnessctl, self._xrandr]
+            if self.method in ways:
+                ways.remove(self.method)
+                ways.insert(0, self.method)   # try what worked last time first
+            problems = []
+            for way in ways:
+                if way in self.failed:
+                    continue
+                try:
+                    result = way(step)
+                    self.method = way
+                    return result
+                except Exception as e:
+                    self.failed.add(way)
+                    problems.append(str(e))
+            self.failed.clear()   # let the user fix it (e.g. install a tool) and try again
+            raise RuntimeError("brightness can't be changed here: " + "; ".join(problems))
+
+    @staticmethod
+    def _run(command):
+        """Runs a command and returns its output. Raises RuntimeError if it fails."""
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(f"{command[0]}: {e}")
+        if result.returncode != 0:
+            raise RuntimeError(f"{command[0]}: {(result.stderr or result.stdout).strip()[:100] or 'failed'}")
+        return result.stdout
+
+    # ----- Windows: the laptop screen's own setting (same idea as Kinesis' actions.py) -----
+    @staticmethod
+    def _windows(step):
+        command = ("$m = Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness | Select-Object -First 1; "
+                   f"$level = [Math]::Max(0, [Math]::Min(100, $m.CurrentBrightness + ({step}))); "
+                   "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods | Select-Object -First 1)"
+                   ".WmiSetBrightness(1, $level) | Out-Null")
+        subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                         creationflags=0x08000000)   # in the background, no console window
+        return None
+
+    # ----- Linux 1: brightnessctl changes the real backlight (laptops) -----
+    def _brightnessctl(self, step):
+        if not shutil.which("brightnessctl"):
+            raise RuntimeError("brightnessctl not installed (sudo apt install brightnessctl)")
+        self._run(["brightnessctl", "-q", "set", f"{abs(step)}%{'+' if step > 0 else '-'}"])
+        return "backlight"
+
+    # ----- Linux 2: xrandr dims the picture in software (works in a VM and on monitors) -----
+    def _xrandr(self, step):
+        if not shutil.which("xrandr"):
+            raise RuntimeError("xrandr not installed (sudo apt install x11-xserver-utils)")
+        if not os.environ.get("DISPLAY"):
+            raise RuntimeError("xrandr needs an X11 desktop (DISPLAY isn't set; Wayland isn't supported)")
+        info = self._run(["xrandr", "--verbose"])
+        outputs, current = [], None
+        for line in info.splitlines():
+            if " connected" in line and not line.startswith(" "):
+                outputs.append(line.split()[0])           # e.g. "Virtual-1" or "HDMI-1"
+            elif line.strip().startswith("Brightness:") and current is None:
+                current = float(line.split(":")[1])
+        if not outputs:
+            raise RuntimeError("xrandr found no connected screen")
+        if self.xrandr_level is None:
+            self.xrandr_level = current if current is not None else 1.0
+        # Keep at least 20%, so the screen never goes completely black.
+        self.xrandr_level = round(max(0.2, min(1.0, self.xrandr_level + step / 100)), 2)
+        for output in outputs:
+            self._run(["xrandr", "--output", output, "--brightness", str(self.xrandr_level)])
+        return f"{self.xrandr_level:.0%}, software dimming"
+
+    # ----- macOS 1: the free `brightness` tool (brew install brightness) -----
+    def _mac_cli(self, step):
+        if not shutil.which("brightness"):
+            raise RuntimeError("'brightness' tool not installed (brew install brightness)")
+        listing = self._run(["brightness", "-l"])
+        levels = [float(line.rsplit(" ", 1)[1]) for line in listing.splitlines() if "brightness " in line]
+        if not levels:
+            raise RuntimeError("brightness: no display found")
+        level = max(0.0, min(1.0, levels[0] + step / 100))
+        self._run(["brightness", f"{level:.2f}"])
+        return f"{level:.0%}"
+
+    # ----- macOS 2: press the brightness keys (needs Accessibility permission for Terminal/Python) -----
+    def _mac_keys(self, step):
+        key_code = 144 if step > 0 else 145   # Apple's brightness up / down keys
+        self._run(["osascript", "-e", f'tell application "System Events" to key code {key_code}'])
+        return None
+
+
+_brightness = Brightness()
 
 
 # Each group is one tick box in the window. key -> (label shown in the log, what to do)
@@ -105,9 +204,9 @@ GROUPS = [
     ("screenshot", "Screenshots (saved on this PC)", True, {
         "screenshot": ("Screenshot", _screenshot),
     }),
-    ("brightness", "Screen brightness (laptop)", True, {
-        "brightness_up": ("Brightness Up", lambda: _brightness(BRIGHTNESS_STEP)),
-        "brightness_down": ("Brightness Down", lambda: _brightness(-BRIGHTNESS_STEP)),
+    ("brightness", "Screen brightness", True, {
+        "brightness_up": ("Brightness Up", lambda: _brightness.change(BRIGHTNESS_STEP)),
+        "brightness_down": ("Brightness Down", lambda: _brightness.change(-BRIGHTNESS_STEP)),
     }),
     # Off by default: a custom shortcut can be any key combination (even Alt+F4).
     ("shortcuts", "Custom keyboard shortcuts (any key combination)", False, {}),
@@ -347,11 +446,12 @@ class Receiver(QObject):
             self.log.emit(f"Blocked (not allowed): {gesture} -> {label}")
             return {"type": "done", "id": msg_id, "ok": False, "reason": f"'{label}' is not allowed on that PC"}
         try:
-            run()
+            result = run()   # brightness returns the new level as text, e.g. "75%, software dimming"
         except Exception as e:
             self.log.emit(f"FAILED: {gesture} -> {label}: {e}")
-            return {"type": "done", "id": msg_id, "ok": False, "reason": str(e)[:120]}
-        self.log.emit(f"{gesture} -> {label}" if gesture else label)
+            return {"type": "done", "id": msg_id, "ok": False, "reason": str(e)[:200]}
+        detail = f" ({result})" if isinstance(result, str) else ""
+        self.log.emit((f"{gesture} -> {label}" if gesture else label) + detail)
         return {"type": "done", "id": msg_id, "ok": True}
 
     def _lookup(self, message):

@@ -37,6 +37,28 @@ Kinesis can control a **second PC** on the same Wi-Fi network or phone hotspot. 
 - **Allow-list only:** the receiver performs only Kinesis' known actions in the ticked groups (clicks, cursor, scroll/zoom, volume/media, slides/windows, copy/paste/undo, screenshots, brightness). Anything else is refused and logged. Custom keyboard shortcuts are **off** by default because a shortcut can be any key combination.
 - If the connection drops, the receiver lets go of any mouse button Kinesis was holding (so a drag never gets stuck).
 
+## Receiver on Linux or macOS
+
+`receiver.py` also runs on Linux (X11 desktops such as Xfce, e.g. Kali in VMware) and macOS. It needs the same two files, `receiver.py` and `remote.py`. Copy **both**, and recopy them whenever they change.
+
+```bash
+# Linux (Debian / Ubuntu / Kali)
+sudo apt install python3-pyqt5 python3-tk python3-dev scrot   # if PyQt5 or PyAutoGUI complain
+pip install PyAutoGUI
+sudo apt install brightnessctl x11-xserver-utils               # for brightness (see below)
+python3 receiver.py
+```
+
+**Brightness** works differently on each system, so the receiver tries these in order and uses the first that works:
+
+| System | 1st try | If that fails |
+|--------|---------|---------------|
+| Windows | Windows' own brightness setting (laptop screens) | - |
+| Linux | `brightnessctl`: the real backlight (laptops; you may need `sudo usermod -aG video $USER`, then log out and in) | `xrandr --brightness`: dims the picture in software. Works in a VM and on external monitors, never below 20% |
+| macOS | the `brightness` tool (`brew install brightness`) | presses the brightness keys (allow Terminal under System Settings -> Privacy -> Accessibility) |
+
+In a virtual machine there is no real backlight, so brightnessctl fails and xrandr's software dimming is used. The receiver's log shows the new level, e.g. `thumbs_up -> Brightness Up (85%, software dimming)`. If nothing works, the log (and Kinesis' activity log) says what to install. xrandr needs an X11 session; it doesn't work on Wayland.
+
 ## If it won't connect
 
 - Both PCs must be on the **same** network. Use the IP shown in the receiver window (if it lists several, pick the one that starts like your laptop's IP, e.g. both `192.168.43.x`).
