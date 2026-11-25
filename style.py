@@ -249,6 +249,15 @@ QCheckBox::indicator {
     background-color: #160f29;
 }
 QCheckBox::indicator:checked { background-color: #7c4dff; border-color: #7c4dff; }
+QRadioButton { spacing: 6px; background: transparent; }
+QRadioButton::indicator {
+    width: 14px; height: 14px;
+    border-radius: 8px;
+    border: 1px solid #5a4b8a;
+    background-color: #160f29;
+}
+QRadioButton::indicator:checked { background-color: #7c4dff; border: 3px solid #160f29; }
+QRadioButton:disabled { color: #6f6290; }
 QListWidget {
     background-color: #160f29;
     border: 1px solid #2f2550;

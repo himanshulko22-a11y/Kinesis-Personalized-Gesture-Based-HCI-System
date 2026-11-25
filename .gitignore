@@ -20,3 +20,8 @@ __pycache__/
 *.pyc
 .vscode/
 .venv/
+
+# PyInstaller output (e.g. building receiver.py into an .exe)
+build/
+dist/
+*.spec

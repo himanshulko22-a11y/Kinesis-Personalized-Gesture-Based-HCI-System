@@ -26,6 +26,7 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 - **Instant delete with undo:** deleting poses or movements (one at a time or several at once) is instant - deleted poses are ignored until you next retrain. Deleted gestures go to a trash file: **Undo** right after, or **Restore Deleted Gestures** later. The trash keeps them for 30 days (then they're removed automatically), or click **Empty Trash** to remove them now.
 - **Faster tracking option:** switch MediaPipe to its lite hand model for a higher frame rate.
 - **Collapsible panel:** every section of the side panel can be opened or closed (or all at once), and the app remembers your choice.
+- **Remote control over Wi-Fi:** control a second PC on the same Wi-Fi or phone hotspot. That PC runs the small `receiver.py` app (no camera or ML), which shows its IP address and a pairing code and only performs the actions its owner allows. Kinesis sends each action as a small JSON message and shows the round-trip time. See [REMOTE_CONTROL.md](REMOTE_CONTROL.md).
 - **Safety options:** pause recognition at any time, reset all data, and save or restore a default setup. Gestures never fire while a dialog is open.
 
 ## Available actions
@@ -89,6 +90,8 @@ Click **Restore Defaults** (in *Danger Zone*) to load the included default gestu
 | `config.py` | All settings and file paths |
 | `camera_test.py` | Measures which camera mode is fastest on your webcam |
 | `camera_reset.py` | Switches the webcam back to automatic exposure |
+| `remote.py` | Remote control: connects to a receiver and sends it actions (network thread, so the window never freezes) |
+| `receiver.py` | The app for the PC being controlled: pairing code, allow-list, log (run it on that PC) |
 | `style.py` | Window theme |
 
 ## Included default dataset

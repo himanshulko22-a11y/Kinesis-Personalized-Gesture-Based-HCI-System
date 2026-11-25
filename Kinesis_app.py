@@ -9,6 +9,7 @@ Files:
   widgets.py   small UI pieces (buttons, mapping row, confusion matrix)
   camera.py    webcam reader
   movements.py dynamic gestures (movements) with DTW
+  remote.py    remote control: sends actions to receiver.py on another PC over Wi-Fi
   style.py     window theme
 """
 import json
@@ -27,8 +28,9 @@ from PyQt5.QtCore import QRectF, Qt, QTimer, QUrl
 from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath,
                          QPalette, QPixmap)
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog, QKeySequenceEdit, QLabel, QLineEdit,
-    QListView, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog, QKeySequenceEdit, QLabel,
+    QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QRadioButton,
+    QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
 import config as cfg
@@ -37,9 +39,10 @@ import livetest as lt
 import movetest as mt
 import actions
 import movements as mv
+import remote
 from camera import Camera
 from actions import (ACTIONS, SHORTCUT_PREFIX, add_shortcut, custom_shortcuts, hotkey_pressed, load_settings,
-                     parse_hotkey, remove_shortcut, save_settings)
+                     parse_hotkey, remove_shortcut, save_settings, shortcut_keys)
 from style import STYLESHEET
 from widgets import (CollapsibleSection, ConfusionMatrixDialog, GestureMappingRow, HandTile, SelectGesturesDialog,
                      ask, button, clear_layout, field_label, note)
@@ -110,6 +113,8 @@ class KinesisApp(QMainWindow):
         self.live_test = None               # the Live Test in progress
         self.move_test = None               # the Movement Test in progress (also uses mode "livetest")
         self.replacing = None               # gesture being re-recorded: its old data goes when the new is saved
+        self.remote = remote.RemoteClient() # sends actions to receiver.py on another PC (see remote.py)
+        self.send_to_remote = False         # True: actions go to the remote PC instead of this one
         for text in self.settings.get("shortcuts", []):
             try:
                 add_shortcut(text)   # before the mapping loads, so gestures can keep these actions
@@ -307,6 +312,8 @@ class KinesisApp(QMainWindow):
                              "retrain whenever it suits you.", name="deleteBtn"))
         box.addLayout(row)
 
+        self._build_remote_section(self._section(col, "Remote Control", True))
+
         box = self._section(col, "Add New Gesture", True)
         row = QHBoxLayout()
         self.name_input = QLineEdit()
@@ -482,6 +489,47 @@ class KinesisApp(QMainWindow):
 
         self._set_recording_buttons()
         self._refresh_after_model_change()
+
+    def _build_remote_section(self, box):
+        """Remote Control: send this PC's gesture actions to another PC running receiver.py."""
+        box.addWidget(note("Control another PC on the same Wi-Fi or phone hotspot. On that PC, run "
+                           "receiver.py (or Kinesis Receiver.exe) and type the IP address and pairing code "
+                           "it shows here. The camera stays on this PC; only the actions are sent."))
+        row = QHBoxLayout()
+        self.remote_ip_input = QLineEdit(self.settings.get("remote_ip", ""))
+        self.remote_ip_input.setPlaceholderText("Receiver IP, e.g. 192.168.43.20")
+        self.remote_ip_input.setToolTip("Shown in the receiver window. Add :port only if the receiver uses "
+                                        f"a port other than {remote.DEFAULT_PORT}.")
+        row.addWidget(self.remote_ip_input, 3)
+        self.remote_code_input = QLineEdit()
+        self.remote_code_input.setPlaceholderText("Pairing code")
+        self.remote_code_input.setMaxLength(6)
+        self.remote_code_input.setToolTip("The 6-digit code shown in the receiver window.")
+        row.addWidget(self.remote_code_input, 2)
+        self.remote_connect_btn = button("Connect", self.toggle_remote_connection)
+        row.addWidget(self.remote_connect_btn)
+        box.addLayout(row)
+        self.remote_status_label = QLabel("")
+        self.remote_status_label.setWordWrap(True)
+        box.addWidget(self.remote_status_label)
+        row = QHBoxLayout()
+        row.addWidget(field_label("Send actions to:"))
+        self.local_radio = QRadioButton("This PC")
+        self.remote_radio = QRadioButton("Remote PC")
+        self.local_radio.setChecked(True)
+        self.remote_radio.setEnabled(False)   # until connected
+        self.target_group = QButtonGroup(self)
+        for radio in (self.local_radio, self.remote_radio):
+            self.target_group.addButton(radio)
+            row.addWidget(radio)
+        row.addStretch()
+        self.remote_radio.toggled.connect(self._set_send_to_remote)
+        box.addLayout(row)
+        self.remote_last_label = QLabel("Last sent: -")
+        self.remote_last_label.setObjectName("lastActionLabel")
+        self.remote_last_label.setWordWrap(True)
+        box.addWidget(self.remote_last_label)
+        self._show_remote_status("Not connected", "#9d8ec2")
 
     def _section(self, layout, title, default_open, danger=False):
         """Adds a collapsible section and returns the layout to put its contents in.
@@ -1822,6 +1870,7 @@ class KinesisApp(QMainWindow):
             self._log(self.camera.messages.pop(0))
         while actions.messages:
             self._log(actions.messages.pop(0))
+        self._poll_remote()
         self._check_mistake_hotkey()
         self._check_training()
         frame, self.frame_id = self.camera.latest(self.frame_id)
@@ -1912,7 +1961,7 @@ class KinesisApp(QMainWindow):
         elif self.paused:
             state, text = "paused", "❚❚  PAUSED"
         else:
-            state, text = "live", "●  LIVE"
+            state, text = "live", "●  LIVE → REMOTE PC" if self._remote_on() else "●  LIVE"
         if text != self.status_pill_text:
             self.status_pill_text = text
             self.status_pill.setText(text)
@@ -2187,11 +2236,11 @@ class KinesisApp(QMainWindow):
             self.mark_mistake(f"{name} movement")
             return
         try:
-            action.fn()
+            where = self._run_action(action_key, action, name)
             self.last_fired = {"time": now, "hand": label, "gesture": name, "action": action.label,
                                "kind": "movement", "path": movement}
-            self.last_action_label.setText(f"Last action: {label} hand movement {name} -> {action.label}")
-            self._log(f"{label} hand movement: {name} -> {action.label} (DTW distance {distance:.3f})")
+            self.last_action_label.setText(f"Last action: {label} hand movement {name} -> {action.label}{where}")
+            self._log(f"{label} hand movement: {name} -> {action.label}{where} (DTW distance {distance:.3f})")
         except Exception as e:
             self.last_action_label.setText(f"Action failed: {e}")
             self._log(f"{label} hand movement: {name} -> {action.label} FAILED: {e}")
@@ -2200,19 +2249,28 @@ class KinesisApp(QMainWindow):
         self.cursor_used = True
         target = g.cursor_position(landmarks, self.cursor_sensitivity, SCREEN_W, SCREEN_H)
         position = self.cursor.update(*target, time.time())
-        if position is not None:
+        if position is None:
+            return
+        if self._remote_on():
+            # Sent as a fraction of the screen, so it lands in the same place on a screen of any size
+            self.remote.move_cursor(position[0] / SCREEN_W, position[1] / SCREEN_H)
+        else:
             pyautogui.moveTo(*position)
 
     # ---------- Press-and-hold buttons ----------
 
     def _press_button(self, label, gesture, action):
+        on_remote = self._remote_on()
         try:
-            pyautogui.mouseDown(button=action.fn)
+            if on_remote:
+                self.remote.send_mouse(action.fn, True, gesture, action.label)
+            else:
+                pyautogui.mouseDown(button=action.fn)
         except Exception as e:
             self._log(f"{label} hand: {gesture} -> {action.label} FAILED: {e}")
             return
         self.held_buttons[label] = {"button": action.fn, "gesture": gesture, "label": action.label,
-                                    "kind": action.kind}
+                                    "kind": action.kind, "remote": on_remote}   # released where it was pressed
         self.last_action_label.setText(f"Last action: {label} hand {gesture} -> {action.label} (holding)")
         self._log(f"{label} hand: {gesture} -> {action.label} (pressed)")
 
@@ -2221,7 +2279,11 @@ class KinesisApp(QMainWindow):
         if held is None:
             return
         try:
-            pyautogui.mouseUp(button=held["button"])
+            if held.get("remote"):
+                # (if the link already dropped, the receiver let go of the button by itself)
+                self.remote.send_mouse(held["button"], False, held["gesture"], held["label"])
+            else:
+                pyautogui.mouseUp(button=held["button"])
         except Exception as e:
             self._log(f"Releasing the {held['button']} button failed: {e}")
         self.last_action_label.setText(f"Last action: {label} hand released {held['button']} button")
@@ -2296,15 +2358,108 @@ class KinesisApp(QMainWindow):
                     self.mark_mistake(f"{stable} gesture")
                     return stable, confidence, action_key
                 try:
-                    action.fn()
+                    where = self._run_action(action_key, action, stable)
                     self.last_fired = {"time": now, "hand": label, "gesture": stable,
                                        "action": action.label, "frames": list(state.features)}
-                    self.last_action_label.setText(f"Last action: {label} hand {stable} -> {action.label}")
-                    self._log(f"{label} hand: {stable} -> {action.label}")
+                    self.last_action_label.setText(f"Last action: {label} hand {stable} -> {action.label}{where}")
+                    self._log(f"{label} hand: {stable} -> {action.label}{where}")
                 except Exception as e:
                     self.last_action_label.setText(f"Action failed: {e}")
                     self._log(f"{label} hand: {stable} -> {action.label} FAILED: {e}")
         return stable, confidence, action_key
+
+    # ---------- Remote control (see remote.py and receiver.py) ----------
+
+    def toggle_remote_connection(self):
+        """Connect / Disconnect button. Connecting happens in the background (the window never freezes)."""
+        if self.remote.state != "idle":
+            self.remote.disconnect()          # puts a "disconnected" event, handled in _poll_remote
+            return
+        try:
+            host, port = remote.parse_address(self.remote_ip_input.text())
+        except ValueError as e:
+            self._show_remote_status(str(e), "#ff7a93")
+            return
+        code = self.remote_code_input.text().strip()
+        if not (len(code) == 6 and code.isdigit()):
+            self._show_remote_status("Type the 6-digit pairing code shown in the receiver window.", "#ff7a93")
+            return
+        self.settings["remote_ip"] = self.remote_ip_input.text().strip()   # remembered for next time
+        save_settings(self.settings)
+        self.remote.connect(host, port, code)
+        self.remote_connect_btn.setText("Cancel")
+        self._show_remote_status(f"Connecting to {host}:{port}...", "#ffb86b")
+
+    def _poll_remote(self):
+        """Called every frame: handles what the network thread reported since the last frame."""
+        while not self.remote.events.empty():
+            event = self.remote.events.get()
+            kind = event[0]
+            if kind == "connected":
+                host, port = self.remote.address
+                self.remote_connect_btn.setText("Disconnect")
+                self.remote_radio.setEnabled(True)
+                self.remote_radio.setChecked(True)   # sending to the remote PC is why you connected
+                self._show_remote_status(f"Connected to {event[1]} ({host})", "#5ee39a")
+                self._log(f"Remote: connected to {event[1]} ({host}:{port}) - actions now go to that PC")
+            elif kind == "done":
+                info = event[1]
+                if info["ok"]:
+                    self.remote_last_label.setText(f"Last sent: {info['gesture']} -> {info['label']} "
+                                                   f"({info['latency_ms']:.0f} ms)")
+                else:
+                    self.remote_last_label.setText(f"Last sent: {info['gesture']} -> {info['label']} "
+                                                   f"- refused: {info['reason']}")
+                    self._log(f"Remote PC refused {info['label']}: {info['reason']}")
+            else:   # "failed", "lost" or "disconnected": back to controlling this PC
+                self._remote_closed(kind, event[1] if len(event) > 1 else "")
+
+    def _remote_closed(self, kind, reason):
+        was_remote = self.send_to_remote
+        self.local_radio.setChecked(True)       # actions run on this PC again
+        self.remote_radio.setEnabled(False)
+        self.remote_connect_btn.setText("Connect")
+        if kind == "failed":
+            self._show_remote_status(f"Couldn't connect: {reason}", "#ff7a93")
+            self._log(f"Remote: couldn't connect - {reason}")
+        elif kind == "lost":
+            self._show_remote_status(f"Connection lost: {reason} Actions now run on this PC.", "#ff7a93")
+            self._log(f"Remote: connection lost - {reason}")
+            if was_remote:
+                self.status_label.setText("Remote PC disconnected - actions now run on this PC.")
+        else:
+            self._show_remote_status("Disconnected", "#9d8ec2")
+            self._log("Remote: disconnected")
+
+    def _show_remote_status(self, text, colour):
+        self.remote_status_label.setText(text)
+        self.remote_status_label.setStyleSheet(f"color: {colour};")
+
+    def _set_send_to_remote(self, on):
+        """'Send actions to' changed. Anything held down (mouse button, zoom's Ctrl) is let go first,
+        on the PC that has it, so nothing gets stuck when switching."""
+        on = bool(on) and self.remote.connected
+        if on == self.send_to_remote:
+            return
+        self._clear_prediction_state()
+        self.send_to_remote = on
+        if self.remote.connected or not on:
+            self._log("Actions now go to " + ("the remote PC" if on else "this PC"))
+
+    def _remote_on(self):
+        return self.send_to_remote and self.remote.connected
+
+    def _run_action(self, action_key, action, gesture):
+        """Performs an action here, or sends it to the remote PC. Returns text for the 'Last action' line."""
+        if not self._remote_on():
+            action.fn()
+            return ""
+        if action_key.startswith(SHORTCUT_PREFIX):
+            keys = shortcut_keys(action_key[len(SHORTCUT_PREFIX):])
+            self.remote.send_shortcut(keys, gesture, action.label)
+        else:
+            self.remote.send_action(action_key, gesture, action.label)
+        return " (sent to remote PC)"
 
     # ---------- Two-hand zoom ----------
 
@@ -2316,10 +2471,15 @@ class KinesisApp(QMainWindow):
         amount = int(min(abs(distance - previous) * cfg.ZOOM_SENSITIVITY, cfg.ZOOM_MAX_STEP))
         if amount < 1:
             return
+        zoom_in = distance > previous
+        if self._remote_on():
+            self.remote.send_zoom(amount if zoom_in else -amount)   # the receiver does Ctrl+scroll in one go
+            self.last_action_label.setText("Last action: " + ("Hands apart -> Zoom in" if zoom_in
+                                                              else "Hands together -> Zoom out") + " (remote PC)")
+            return
         if not self.zoom_ctrl_held:
             pyautogui.keyDown("ctrl")
             self.zoom_ctrl_held = True
-        zoom_in = distance > previous
         pyautogui.scroll(amount if zoom_in else -amount)
         self.last_action_label.setText("Last action: " + ("Hands apart -> Zoom in" if zoom_in
                                                           else "Hands together -> Zoom out"))
@@ -2340,6 +2500,7 @@ class KinesisApp(QMainWindow):
         self.timer.stop()
         self._release_all_buttons()
         self._release_zoom_ctrl()
+        self.remote.disconnect(quiet=True)
         self.camera.release()
         self.hands.close()
         event.accept()
