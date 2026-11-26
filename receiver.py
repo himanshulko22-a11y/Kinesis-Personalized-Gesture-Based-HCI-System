@@ -375,7 +375,7 @@ class Receiver(QObject):
         if self.wrong_codes.get(ip, 0) >= MAX_WRONG_CODES:
             self.log.emit(f"Blocked {ip}: too many wrong codes (click 'New code' to let it try again)")
             return refuse("Too many wrong pairing codes. Ask the receiver's owner for a new code.")
-        if not secrets.compare_digest(str(hello.get("code", "")).strip(), self.code):
+        if not secrets.compare_digest(str(hello.get("code", "")).strip().encode(), self.code.encode()):
             self.wrong_codes[ip] = self.wrong_codes.get(ip, 0) + 1
             self.log.emit(f"Wrong pairing code from {ip} ({self.wrong_codes[ip]}/{MAX_WRONG_CODES})")
             time.sleep(WRONG_CODE_DELAY)

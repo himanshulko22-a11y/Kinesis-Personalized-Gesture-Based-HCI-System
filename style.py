@@ -153,7 +153,7 @@ QPushButton#dangerHeader { color: #ff7a93; }
 QPushButton#sectionHeader:hover, QPushButton#dangerHeader:hover {
     background-color: #241a3d;
 }
-QLabel#sectionTitle, QLabel#fieldLabel {
+QLabel#fieldLabel {
     font-size: 12px;
     font-weight: bold;
     color: #b3a6d6;

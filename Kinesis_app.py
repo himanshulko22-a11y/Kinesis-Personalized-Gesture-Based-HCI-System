@@ -1215,8 +1215,8 @@ class KinesisApp(QMainWindow):
 
     def _check_mistake_hotkey(self):
         """The mistake hotkey works from any app (Windows only)."""
-        if sys.platform != "win32" or self.hotkey_edit.hasFocus() or self.shortcut_edit.hasFocus():
-            return   # not while the user is choosing a new hotkey
+        if sys.platform != "win32" or isinstance(QApplication.focusWidget(), (QLineEdit, QKeySequenceEdit)):
+            return   # not while typing in Kinesis (a gesture name with 'z', or choosing a new hotkey)
         down = hotkey_pressed(self.hotkey_codes)
         if down and not self.hotkey_down:
             self.mark_mistake(self.mistake_hotkey)

@@ -19,7 +19,7 @@ SETTINGS = [
 
 
 def measure(backend, mjpg, exposure, seconds=2.5):
-    for attempt in range(4):   # Windows needs a moment to release the camera between tests
+    for _ in range(4):   # Windows needs a moment to release the camera between tests
         cap = open_camera(backend, mjpg, exposure)
         if cap.isOpened():
             break
