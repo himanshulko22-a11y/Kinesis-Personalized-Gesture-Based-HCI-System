@@ -9,6 +9,8 @@ Kinesis can control a **second PC** on the same Wi-Fi network or phone hotspot. 
  shows "Last sent: swipe_right -> Next Slide (8 ms)"
 ```
 
+Everything between the two PCs is **encrypted with TLS** (1.2 or newer), including the pairing code.
+
 ## The two parts
 
 | Part | Runs on | What it does |
@@ -23,15 +25,16 @@ Kinesis can control a **second PC** on the same Wi-Fi network or phone hotspot. 
    `pip install PyQt5 PyAutoGUI`
 3. On the other PC run: `python receiver.py`
    - The first time, **Windows Firewall** asks whether to allow Python. Tick **Private networks** and also **Public networks** (Windows often marks a phone hotspot as public), then click **Allow access**.
-   - The window shows something like `IP 192.168.43.20` and `Pairing code 482913`.
+   - The window shows something like `IP 192.168.43.20`, `Pairing code 482913` and a green **certificate fingerprint** such as `EDDE 9056 3E6D 5FEB`.
 4. On your laptop run Kinesis as usual (`python Kinesis_app.py`). Open the **Remote Control** section, type the IP and the code, and press **Connect**.
-5. When it says **Connected**, *Send actions to* switches to **Remote PC** and the status pill reads **LIVE → REMOTE PC**. Your gestures now act on the other PC (for example, open a PowerPoint there and swipe to change slides). The receiver's log shows each action as it arrives.
+5. Kinesis says *Connected ... encrypted with TLSv1.3. Fingerprint EDDE 9056 3E6D 5FEB (first connection: check it matches the receiver window)*. Check the fingerprint is the same as on the receiver. When it says **Connected**, *Send actions to* switches to **Remote PC** and the status pill reads **LIVE → REMOTE PC**. Your gestures now act on the other PC (for example, open a PowerPoint there and swipe to change slides). The receiver's log shows each action as it arrives.
 6. Switch back with **This PC**, press **Disconnect**, or press **Stop receiving** on the other PC. If the link drops, Kinesis goes back to controlling your own laptop by itself and says so.
 
 **Practice on one PC first:** run `python receiver.py` and Kinesis on the same laptop, connect to `127.0.0.1` with the code shown. Everything works the same, just on one screen.
 
 ## Safety
 
+- **Encrypted:** all traffic uses TLS 1.2+, so other devices on the Wi-Fi can't read the pairing code or the actions, or change them on the way. On its first run the receiver makes its own certificate (`receiver_cert.pem` + `receiver_key.pem`, next to `receiver.py`; nothing to install). Kinesis remembers the receiver's fingerprint on the first connection ("trust on first use"). If the fingerprint is ever different, Kinesis refuses to connect **before sending the pairing code** and shows a warning. If you know why it changed (you deleted the two .pem files, or the receiver moved to another PC) and the fingerprint matches the receiver window, click **Trust the new certificate and connect**.
 - The receiver must be started by the other PC's owner. Nothing can connect to a PC that isn't running it.
 - The 6-digit pairing code is required. After 5 wrong codes, that PC is blocked until **New code** is pressed. Only one Kinesis PC can be in control at a time.
 - **Allow-list only:** the receiver performs only Kinesis' known actions in the ticked groups (clicks, cursor, scroll/zoom, volume/media, slides/windows, copy/paste/undo, screenshots, brightness). Anything else is refused and logged. Custom keyboard shortcuts are **off** by default because a shortcut can be any key combination.
@@ -39,7 +42,7 @@ Kinesis can control a **second PC** on the same Wi-Fi network or phone hotspot. 
 
 ## Receiver on Linux or macOS
 
-`receiver.py` also runs on Linux (X11 desktops such as Xfce, e.g. Kali in VMware) and macOS. It needs the same two files, `receiver.py` and `remote.py`. Copy **both**, and recopy them whenever they change.
+`receiver.py` also runs on Linux (X11 desktops such as Xfce, e.g. Kali in VMware) and macOS. It needs the same two files, `receiver.py` and `remote.py`. Copy **both**, and recopy them whenever they change. The certificate is made with Python's `cryptography` package if installed (Kali has it), otherwise with the `openssl` command (always on Kali), so no extra install is needed for encryption.
 
 ```bash
 # Linux (Debian / Ubuntu / Kali)
@@ -62,12 +65,15 @@ In a virtual machine there is no real backlight, so brightnessctl fails and xran
 ## If it won't connect
 
 - Both PCs must be on the **same** network. Use the IP shown in the receiver window (if it lists several, pick the one that starts like your laptop's IP, e.g. both `192.168.43.x`).
+- *"Encrypted (TLS) connection failed"* in Kinesis, or *"not an encrypted Kinesis connection"* in the receiver log: one PC has the new files and the other the old ones. Copy the new `receiver.py` **and** `remote.py` to the receiver PC.
+- *"Encryption isn't available"* in the receiver: it couldn't make a certificate. Run `pip install cryptography` (Windows) or `sudo apt install openssl` (Linux).
 - Check Windows Firewall allowed the receiver (Windows Security -> Firewall -> *Allow an app through firewall* -> Python).
 - **College or office Wi-Fi often blocks PC-to-PC traffic** ("client isolation"). Use a phone hotspot instead.
 
 ## Technical notes (for the report or viva)
 
-- **Transport:** TCP on port `50607`, one JSON message per line. The receiver listens on all network cards (`0.0.0.0`).
+- **Transport:** TCP on port `50607`, wrapped in **TLS 1.2+** (Python's `ssl` module), one JSON message per line. The receiver listens on all network cards (`0.0.0.0`).
+- **Certificate and trust:** the receiver's certificate is self-signed (elliptic-curve P-256 key, valid 10 years), so there's no certificate authority to vouch for it. Kinesis instead pins its **SHA-256 fingerprint** on first use, the same idea SSH uses for host keys. A changed fingerprint (a possible man-in-the-middle) stops the connection before the pairing code is sent.
 - **Messages:** `hello` (with the code) -> `welcome` / `refused`; then `action`, `shortcut`, `mouse` (press/release for drag), `zoom` and `cursor`. Every action gets a `done` reply, used to measure the **round-trip latency**. Kinesis sends a `ping` every 2 s; if either side hears nothing for 8-10 s, the link is treated as lost.
 - **Cursor:** sent as a fraction of the screen (0-1), so it lands in the same place on a screen of any resolution. Only the newest position is sent, so a slow network never builds up a lag.
 - **Never freezes:** all network work runs in a background thread; the Kinesis window reads its results once per frame. On the receiver, network threads talk to the window through Qt signals.

@@ -25,3 +25,7 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# Remote control: the receiver's certificate and PRIVATE KEY (made on first run, never upload)
+receiver_cert.pem
+receiver_key.pem

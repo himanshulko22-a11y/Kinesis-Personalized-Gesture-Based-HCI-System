@@ -4,7 +4,7 @@ Run on the PC you want to control:   python receiver.py
 (or build it into an .exe:            pyinstaller --onefile --windowed receiver.py)
 
 No camera and no machine learning here: this small window just
-  1. listens on the local network (TCP port 50607),
+  1. listens on the local network (TCP port 50607, encrypted with TLS 1.2+),
   2. shows this PC's IP address and a random 6-digit pairing code,
   3. accepts ONE Kinesis PC that sends the right code,
   4. performs only the actions you allow below (an allow-list), using PyAutoGUI,
@@ -29,7 +29,7 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
                              QPushButton, QVBoxLayout, QWidget)
 
-from remote import DEFAULT_PORT, PROTOCOL_VERSION, LineReader, encode, local_ip_addresses
+from remote import DEFAULT_PORT, PROTOCOL_VERSION, LineReader, encode, local_ip_addresses, server_tls_context, short_fingerprint
 
 pyautogui.FAILSAFE = False   # Kinesis may move the cursor into a corner on purpose
 pyautogui.PAUSE = 0          # no 0.1 s pause after every action (that made the cursor stutter)
@@ -277,11 +277,11 @@ class Receiver(QObject):
         with self.lock:
             controller = self.controller
         if controller is not None:
-            try:
-                controller[0].sendall(encode({"type": "stopping"}))
+            try:   # cut the link; the connection's own thread then closes it (TLS sockets aren't shared)
+                socket.socket.shutdown(controller[0], socket.SHUT_RDWR)
             except OSError:
                 pass
-            self._close(controller[0])
+            controller = None
         if self.accept_thread is not None:
             self.accept_thread.join(timeout=2.0)   # it closes the listening socket as it ends
         self.server = None
@@ -314,7 +314,7 @@ class Receiver(QObject):
                 if not self.running:
                     self._close(sock)
                     break
-                threading.Thread(target=self._serve, args=(sock, ip), daemon=True).start()
+                threading.Thread(target=self._serve_secure, args=(sock, ip), daemon=True).start()
         finally:
             server.close()                  # stop listening: nobody else can connect
 
@@ -505,6 +505,24 @@ class Receiver(QObject):
                 pass
         self.held.clear()
 
+    # ----- encryption (TLS) -----
+
+    tls = None              # ssl context, set by the window before start() (see remote.server_tls_context)
+
+    def _serve_secure(self, raw, ip):
+        """Runs the TLS handshake for a new connection, then handles it like before (_serve)."""
+        if self.tls is None:
+            self._close(raw)
+            return
+        raw.settimeout(5.0)                  # a PC that connects but never finishes the handshake
+        try:
+            sock = self.tls.wrap_socket(raw, server_side=True)
+        except (OSError, ValueError) as e:  # ssl.SSLError is an OSError
+            self.log.emit(f"Refused {ip}: not an encrypted Kinesis connection (old Kinesis version?) - {e}")
+            self._close(raw)
+            return
+        self._serve(sock, ip)
+
 
 # ---------- Window ----------
 
@@ -515,6 +533,7 @@ QLabel { background: transparent; }
 QLabel#title { font-size: 22px; font-weight: 800; color: #b794ff; }
 QLabel#caption { font-size: 11px; font-weight: bold; color: #8a7bb0; }
 QLabel#big { font-size: 26px; font-weight: bold; color: #ffffff; }
+QLabel#fingerprint { font-family: Consolas, "DejaVu Sans Mono", monospace; font-size: 15px; color: #5ee39a; }
 QLabel#note { font-size: 11px; color: #9d8ec2; }
 QPushButton { background-color: #7c4dff; color: white; border: none; border-radius: 8px; padding: 8px 14px;
               font-weight: bold; }
@@ -535,7 +554,7 @@ class ReceiverWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Kinesis Receiver")
-        self.resize(560, 680)
+        self.resize(560, 760)
         self.receiver = Receiver()
         self.receiver.log.connect(self.add_log)
         self.receiver.status.connect(self.set_status)
@@ -551,6 +570,13 @@ class ReceiverWindow(QWidget):
         info.setObjectName("note")
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        # Encryption: load this PC's certificate, or make one the first time (saved next to receiver.py)
+        tls_error, made = None, False
+        try:
+            self.receiver.tls, cert_fingerprint, made = server_tls_context(os.path.dirname(SCREENSHOT_DIR))
+        except Exception as e:
+            tls_error, cert_fingerprint = str(e), None
 
         # Address and pairing code: type these into Kinesis' Remote Control panel
         card, grid = self._card(layout, QGridLayout)
@@ -573,6 +599,15 @@ class ReceiverWindow(QWidget):
             other.setObjectName("note")
             other.setWordWrap(True)
             grid.addWidget(other, 2, 0, 1, 2)
+        if cert_fingerprint:
+            caption = QLabel("ENCRYPTED (TLS) - CERTIFICATE FINGERPRINT")
+            caption.setObjectName("caption")
+            grid.addWidget(caption, 3, 0, 1, 3)
+            fp_label = QLabel(short_fingerprint(cert_fingerprint))
+            fp_label.setObjectName("fingerprint")
+            fp_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            fp_label.setToolTip("Kinesis shows the same code when it connects. If they differ, don't continue.")
+            grid.addWidget(fp_label, 4, 0, 1, 3)
         code_btn = QPushButton("New code")
         code_btn.setObjectName("secondary")
         code_btn.setToolTip("Makes a new pairing code. The PC in control stays connected.")
@@ -619,6 +654,13 @@ class ReceiverWindow(QWidget):
         layout.addWidget(tip)
         self.setStyleSheet(STYLESHEET)
 
+        if tls_error:
+            self.set_status(f"Encryption isn't available, so receiving is off: {tls_error}", "error")
+            self.add_log(f"Couldn't set up encryption: {tls_error}")
+            self._show_stopped()
+            return
+        self.add_log(("Made a new encryption certificate" if made else "Loaded the encryption certificate") +
+                     f" (fingerprint {short_fingerprint(cert_fingerprint)})")
         if not self.receiver.start():
             self._show_stopped()
 
@@ -645,7 +687,7 @@ class ReceiverWindow(QWidget):
         if self.receiver.running:
             self.receiver.stop()
             self._show_stopped()
-        elif self.receiver.start():
+        elif self.receiver.tls is not None and self.receiver.start():   # never without encryption
             self._set_button("Stop receiving", "stop")
 
     def _show_stopped(self):

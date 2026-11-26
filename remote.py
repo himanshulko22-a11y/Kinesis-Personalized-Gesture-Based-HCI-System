@@ -13,18 +13,34 @@ How it works (in plain words):
 Each message is one line of JSON text ending in a newline ("\n"). This file only uses Python's
 standard library, so receiver.py can share it and still be built into a small .exe.
 
+Encryption (TLS 1.2 or newer): everything, including the pairing code, travels inside a TLS
+connection, so nobody else on the Wi-Fi can read or change it. The receiver makes its own
+"self-signed" certificate the first time it runs (no certificate authority is involved). Instead,
+Kinesis checks the certificate's fingerprint, a short code shown in the receiver window:
+  * first connection: Kinesis remembers the fingerprint ("trust on first use") and shows it, so you
+    can check it matches the receiver window;
+  * later connections: if the fingerprint is different, Kinesis refuses to connect and warns you
+    (someone may be pretending to be that PC), until you say the new certificate is fine.
+
 All network work happens in a background thread, so the Kinesis window never freezes. The window
 reads what happened from RemoteClient.events (a thread-safe queue) on every frame.
 """
+import hashlib
 import json
+import os
 import queue
 import select
+import shutil
 import socket
+import ssl
+import subprocess
 import threading
 import time
 
 DEFAULT_PORT = 50607          # any free port works; both sides must use the same one
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2          # 2 = encrypted with TLS (version 1 was plain text)
+CERT_FILE = "receiver_cert.pem"   # the receiver's certificate and private key, made on first run
+KEY_FILE = "receiver_key.pem"     # (kept next to receiver.py; never share the key file)
 MAX_LINE_BYTES = 4096         # longer messages are refused (nothing we send comes close)
 CONNECT_TIMEOUT = 4.0         # seconds to reach the receiver before giving up
 HANDSHAKE_TIMEOUT = 6.0       # seconds to wait for the receiver to accept the pairing code
@@ -102,6 +118,91 @@ def parse_address(text):
     return host, port
 
 
+# ---------- Encryption (TLS) helpers ----------
+
+def fingerprint(cert_der):
+    """SHA-256 of the certificate, as 64 hex digits. Both sides compute it the same way."""
+    return hashlib.sha256(cert_der).hexdigest().upper()
+
+
+def short_fingerprint(full):
+    """The first 16 hex digits in groups of 4, e.g. '3FA2 91C0 7B4E 22D1' - easy to compare by eye."""
+    return " ".join(full[i:i + 4] for i in range(0, 16, 4))
+
+
+def _make_certificate(cert_path, key_path):
+    """Creates a self-signed certificate + private key (EC P-256, valid 10 years).
+    Uses the 'cryptography' package if installed, otherwise the openssl command (Linux/macOS have it)."""
+    name = socket.gethostname()[:60] or "kinesis-receiver"
+    try:
+        import datetime
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        if not shutil.which("openssl"):
+            raise RuntimeError("Can't make an encryption certificate: install the 'cryptography' package "
+                               "(pip install cryptography) or the openssl command.")
+        result = subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
+                                 "ec_paramgen_curve:prime256v1", "-nodes", "-days", "3650",
+                                 "-subj", f"/CN={name}", "-keyout", key_path, "-out", cert_path],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError(f"openssl couldn't make a certificate: {result.stderr.strip()[:200]}")
+    else:
+        key = ec.generate_private_key(ec.SECP256R1())
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)   # self-signed
+                .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=3650))
+                .sign(key, hashes.SHA256()))
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                      serialization.NoEncryption()))
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+    try:
+        os.chmod(key_path, 0o600)   # only this user may read the private key (Linux/macOS)
+    except OSError:
+        pass
+
+
+def server_tls_context(folder):
+    """For receiver.py: loads (or makes, the first time) its certificate.
+    Returns (ssl context, full fingerprint, True if the certificate was just made)."""
+    cert_path, key_path = os.path.join(folder, CERT_FILE), os.path.join(folder, KEY_FILE)
+    made = not (os.path.exists(cert_path) and os.path.exists(key_path))
+    if made:
+        _make_certificate(cert_path, key_path)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2   # no old, weak SSL/TLS versions
+    context.load_cert_chain(cert_path, key_path)
+    with open(cert_path) as f:
+        der = ssl.PEM_cert_to_DER_cert(f.read())
+    return context, fingerprint(der), made
+
+
+def client_tls_context():
+    """For Kinesis. The certificate is self-signed, so Python's usual check (signed by a known
+    authority, matching a domain name) can't work; the fingerprint is checked instead (see RemoteClient)."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+class UntrustedCertificate(ConnectionError):
+    """The receiver's fingerprint isn't the one Kinesis remembered."""
+
+    def __init__(self, new_fingerprint):
+        super().__init__("certificate changed")
+        self.new_fingerprint = new_fingerprint
+
+
 # ---------- Kinesis side: the client ----------
 
 class RemoteClient:
@@ -114,8 +215,9 @@ class RemoteClient:
         client.disconnect()
 
     Events put on client.events (tuples):
-        ("connected", receiver_name)
+        ("connected", receiver_name, fingerprint, tls_version)
         ("failed", reason)             could not connect / wrong code
+        ("untrusted", new_fingerprint) the receiver's certificate isn't the one we remembered
         ("lost", reason)               was connected, then the link dropped
         ("disconnected",)              you pressed Disconnect
         ("done", info)                 the receiver finished an action; info has
@@ -141,8 +243,9 @@ class RemoteClient:
 
     # ----- called from the UI thread -----
 
-    def connect(self, host, port, code):
-        """Starts connecting in the background. The result arrives as an event."""
+    def connect(self, host, port, code, trusted_fingerprint=None):
+        """Starts connecting in the background. The result arrives as an event.
+        trusted_fingerprint: the receiver's fingerprint from last time (None = first connection)."""
         self.disconnect(quiet=True)
         self._stop = threading.Event()
         self._outbox = queue.Queue()
@@ -150,7 +253,8 @@ class RemoteClient:
         self._cursor = None
         self.address = (host, port)
         self.state = "connecting"
-        self._thread = threading.Thread(target=self._run, args=(host, port, code, self._stop), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(host, port, code, trusted_fingerprint, self._stop),
+                                        daemon=True)
         self._thread.start()
 
     def disconnect(self, quiet=False):
@@ -201,11 +305,11 @@ class RemoteClient:
 
     # ----- background thread -----
 
-    def _run(self, host, port, code, stop):
+    def _run(self, host, port, code, trusted_fingerprint, stop):
         sock = None
         try:
             try:
-                sock = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+                raw = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
             except socket.timeout:
                 raise ConnectionError(f"No answer from {host}:{port}. Check the IP, that the receiver is "
                                       "running, that both PCs are on the same Wi-Fi/hotspot, and that "
@@ -215,7 +319,18 @@ class RemoteClient:
                                       f"(and listening on port {port})?")
             except OSError as e:
                 raise ConnectionError(f"Can't reach {host}:{port} ({e.strerror or e}).")
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # send small messages at once
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # send small messages at once
+            try:
+                # TLS handshake: agree on keys; from here on everything is encrypted
+                sock = client_tls_context().wrap_socket(raw)
+            except (ssl.SSLError, OSError) as e:
+                raw.close()
+                raise ConnectionError(f"Encrypted (TLS) connection failed ({e}). If that PC runs an older "
+                                      "receiver.py, copy the new receiver.py and remote.py to it.")
+            # Is this the same receiver as last time? Checked BEFORE the pairing code is sent.
+            seen = fingerprint(sock.getpeercert(binary_form=True))
+            if trusted_fingerprint and seen != trusted_fingerprint:
+                raise UntrustedCertificate(seen)
             reader = LineReader()
             sock.sendall(encode({"type": "hello", "code": code, "name": socket.gethostname(),
                                  "version": PROTOCOL_VERSION}))
@@ -224,8 +339,12 @@ class RemoteClient:
                 raise ConnectionError(reply.get("reason", "The receiver refused the connection."))
             self.receiver_name = str(reply.get("name", host))[:60]
             self.state = "connected"
-            self.events.put(("connected", self.receiver_name))
+            self.events.put(("connected", self.receiver_name, seen, sock.version()))
             self._loop(sock, reader, stop)
+        except UntrustedCertificate as e:
+            if not stop.is_set():
+                self.state = "idle"
+                self.events.put(("untrusted", e.new_fingerprint))
         except ConnectionError as e:
             if not stop.is_set():
                 kind = "lost" if self.state == "connected" else "failed"
@@ -262,7 +381,7 @@ class RemoteClient:
         raise ConnectionError("The receiver didn't answer the pairing request in time.")
 
     def _loop(self, sock, reader, stop):
-        sock.setblocking(False)
+        sock.settimeout(3.0)                  # a send that takes longer than this means the link is gone
         last_heard = last_ping = time.time()
         while not stop.is_set():
             # 1. Send everything waiting: actions first, then the newest cursor position.
@@ -281,26 +400,25 @@ class RemoteClient:
                 outgoing.append({"type": "ping"})
                 last_ping = now
             if outgoing:
-                data = b"".join(encode(m) for m in outgoing)
-                sock.setblocking(True)
-                sock.settimeout(3.0)
                 try:
-                    sock.sendall(data)
+                    sock.sendall(b"".join(encode(m) for m in outgoing))
                 except OSError as e:
                     raise ConnectionError(f"Sending failed - the link to the receiver dropped ({e}).")
-                sock.setblocking(False)
                 if any(m.get("type") == "bye" for m in outgoing):
                     return
 
-            # 2. Read replies (wait at most 5 ms, so new actions go out quickly).
-            readable, _, _ = select.select([sock], [], [], 0.005)
-            if readable:
+            # 2. Read replies (wait at most 5 ms, so new actions go out quickly). TLS may already hold
+            #    decrypted bytes that select() can't see, so sock.pending() is checked too.
+            if sock.pending() or select.select([sock], [], [], 0.005)[0]:
+                sock.settimeout(0.2)
                 try:
                     data = sock.recv(65536)
-                except BlockingIOError:
-                    data = None
+                except (socket.timeout, ssl.SSLWantReadError):
+                    data = None               # only part of an encrypted record so far
                 except OSError as e:
                     raise ConnectionError(f"The link to the receiver dropped ({e}).")
+                finally:
+                    sock.settimeout(3.0)
                 if data == b"":
                     raise ConnectionError("The receiver closed the connection (it was stopped or closed).")
                 if data:
