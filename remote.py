@@ -103,7 +103,7 @@ def local_ip_addresses():
 
 
 def parse_address(text):
-    """'192.168.1.5' or '192.168.1.5:50607' -> ('192.168.1.5', 50607). Raises ValueError."""
+    """'192.168.x.x' or '192.168.x.x:50607' -> ('192.168.x.x', 50607). Raises ValueError."""
     text = text.strip()
     if not text:
         raise ValueError("Type the receiver's IP address (shown in the receiver window).")
@@ -126,7 +126,7 @@ def fingerprint(cert_der):
 
 
 def short_fingerprint(full):
-    """The first 16 hex digits in groups of 4, e.g. '3FA2 91C0 7B4E 22D1' - easy to compare by eye."""
+    """The first 16 hex digits in groups of 4, e.g. 'XXXX XXXX XXXX XXXX' - easy to compare by eye."""
     return " ".join(full[i:i + 4] for i in range(0, 16, 4))
 
 
@@ -209,7 +209,7 @@ class RemoteClient:
     """Connects to receiver.py on another PC and sends it actions, without blocking the UI.
 
     Use from the UI thread:
-        client.connect("192.168.43.20", 50607, "482913")
+        client.connect("192.168.x.x", 50607, "<pairing code>")
         client.send_action("volume_up", gesture="thumbs_up", label="Volume Up")
         ... every frame:  while not client.events.empty(): handle(client.events.get())
         client.disconnect()

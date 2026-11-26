@@ -32,9 +32,9 @@ Everything between the two PCs is **encrypted with TLS** (1.2 or newer), includi
    `pip install PyQt5 PyAutoGUI`
 3. On the other PC run: `python receiver.py`
    - The first time, **Windows Firewall** asks whether to allow Python. Tick **Private networks** and also **Public networks** (Windows often marks a phone hotspot as public), then click **Allow access**.
-   - The window shows something like `IP 192.168.43.20`, `Pairing code 482913` and a green **certificate fingerprint** such as `EDDE 9056 3E6D 5FEB`.
+   - The window shows something like `IP 192.168.x.x`, `Pairing code XXXXXX` and a green **certificate fingerprint** such as `XXXX XXXX XXXX XXXX`.
 4. On your laptop run Kinesis as usual (`python Kinesis_app.py`). Open the **Remote Control** section, type the IP and the code, and press **Connect**.
-5. Kinesis says *Connected ... encrypted with TLSv1.3. Fingerprint EDDE 9056 3E6D 5FEB (first connection: check it matches the receiver window)*. Check the fingerprint is the same as on the receiver. When it says **Connected**, *Send actions to* switches to **Remote PC** and the status pill reads **LIVE → REMOTE PC**. Your gestures now act on the other PC (for example, open a PowerPoint there and swipe to change slides). The receiver's log shows each action as it arrives.
+5. Kinesis says *Connected ... encrypted with TLSv1.3. Fingerprint XXXX XXXX XXXX XXXX (first connection: check it matches the receiver window)*. Check the fingerprint is the same as on the receiver. When it says **Connected**, *Send actions to* switches to **Remote PC** and the status pill reads **LIVE → REMOTE PC**. Your gestures now act on the other PC (for example, open a PowerPoint there and swipe to change slides). The receiver's log shows each action as it arrives.
 6. Switch back with **This PC**, press **Disconnect**, or press **Stop receiving** on the other PC. If the link drops, Kinesis goes back to controlling your own laptop by itself and says so.
 
 **Practice on one PC first:** run `python receiver.py` and Kinesis on the same laptop, connect to `127.0.0.1` with the code shown. Everything works the same, just on one screen.
@@ -71,7 +71,7 @@ In a virtual machine there is no real backlight, so brightnessctl fails and xran
 
 ## If it won't connect
 
-- Both PCs must be on the **same** network. Use the IP shown in the receiver window (if it lists several, pick the one that starts like your laptop's IP, e.g. both `192.168.43.x`).
+- Both PCs must be on the **same** network. Use the IP shown in the receiver window (if it lists several, pick the one that starts like your laptop's IP, e.g. both `192.168.x.x`).
 - *"Encrypted (TLS) connection failed"* in Kinesis, or *"not an encrypted Kinesis connection"* in the receiver log: one PC has the new files and the other the old ones. Copy the new `receiver.py` **and** `remote.py` to the receiver PC.
 - *"Encryption isn't available"* in the receiver: it couldn't make a certificate. Run `pip install cryptography` (Windows) or `sudo apt install openssl` (Linux).
 - Check Windows Firewall allowed the receiver (Windows Security -> Firewall -> *Allow an app through firewall* -> Python).

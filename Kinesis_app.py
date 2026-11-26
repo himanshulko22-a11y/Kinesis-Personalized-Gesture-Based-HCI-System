@@ -497,7 +497,7 @@ class KinesisApp(QMainWindow):
                            "it shows here. The camera stays on this PC; only the actions are sent."))
         row = QHBoxLayout()
         self.remote_ip_input = QLineEdit(self.settings.get("remote_ip", ""))
-        self.remote_ip_input.setPlaceholderText("Receiver IP, e.g. 192.168.43.20")
+        self.remote_ip_input.setPlaceholderText("Receiver IP, e.g. 192.168.x.x")
         self.remote_ip_input.setToolTip("Shown in the receiver window. Add :port only if the receiver uses "
                                         f"a port other than {remote.DEFAULT_PORT}.")
         row.addWidget(self.remote_ip_input, 3)
@@ -512,6 +512,14 @@ class KinesisApp(QMainWindow):
         self.remote_status_label = QLabel("")
         self.remote_status_label.setWordWrap(True)
         box.addWidget(self.remote_status_label)
+        self.trust_btn = button("Trust the new certificate and connect", self.trust_new_certificate,
+                                "Only if the fingerprint above matches the one in the receiver window "
+                                "(for example after its certificate files were deleted or the receiver moved "
+                                "to another PC).", name="linkBtn")
+        self.trust_btn.setCursor(Qt.PointingHandCursor)
+        self.trust_btn.hide()
+        box.addWidget(self.trust_btn, 0, Qt.AlignLeft)
+        self.untrusted_fingerprint = None   # the changed fingerprint waiting for "Trust"
         row = QHBoxLayout()
         row.addWidget(field_label("Send actions to:"))
         self.local_radio = QRadioButton("This PC")
@@ -1215,8 +1223,8 @@ class KinesisApp(QMainWindow):
 
     def _check_mistake_hotkey(self):
         """The mistake hotkey works from any app (Windows only)."""
-        if sys.platform != "win32" or self.hotkey_edit.hasFocus() or self.shortcut_edit.hasFocus():
-            return   # not while the user is choosing a new hotkey
+        if sys.platform != "win32" or isinstance(QApplication.focusWidget(), (QLineEdit, QKeySequenceEdit)):
+            return   # not while typing in Kinesis (a gesture name with 'z', or choosing a new hotkey)
         down = hotkey_pressed(self.hotkey_codes)
         if down and not self.hotkey_down:
             self.mark_mistake(self.mistake_hotkey)
@@ -2386,7 +2394,10 @@ class KinesisApp(QMainWindow):
             return
         self.settings["remote_ip"] = self.remote_ip_input.text().strip()   # remembered for next time
         save_settings(self.settings)
-        self.remote.connect(host, port, code)
+        self.trust_btn.hide()
+        # Fingerprint remembered from the last connection to this receiver (None = first time)
+        trusted = self.settings.get("remote_fingerprints", {}).get(f"{host}:{port}")
+        self.remote.connect(host, port, code, trusted)
         self.remote_connect_btn.setText("Cancel")
         self._show_remote_status(f"Connecting to {host}:{port}...", "#ffb86b")
 
@@ -2397,11 +2408,31 @@ class KinesisApp(QMainWindow):
             kind = event[0]
             if kind == "connected":
                 host, port = self.remote.address
+                name, cert, tls_version = event[1], event[2], event[3]
+                known = self.settings.setdefault("remote_fingerprints", {})
+                first_time = f"{host}:{port}" not in known
+                known[f"{host}:{port}"] = cert            # trust on first use: remembered for next time
+                save_settings(self.settings)
                 self.remote_connect_btn.setText("Disconnect")
                 self.remote_radio.setEnabled(True)
                 self.remote_radio.setChecked(True)   # sending to the remote PC is why you connected
-                self._show_remote_status(f"Connected to {event[1]} ({host})", "#5ee39a")
-                self._log(f"Remote: connected to {event[1]} ({host}:{port}) - actions now go to that PC")
+                check = ("first connection: check it matches the receiver window" if first_time
+                         else "same as last time")
+                self._show_remote_status(f"Connected to {name} ({host}), encrypted with {tls_version}. "
+                                         f"Fingerprint {remote.short_fingerprint(cert)} ({check})", "#5ee39a")
+                self._log(f"Remote: connected to {name} ({host}:{port}), {tls_version}, fingerprint "
+                          f"{remote.short_fingerprint(cert)} - actions now go to that PC")
+            elif kind == "untrusted":
+                self.untrusted_fingerprint = event[1]
+                self.local_radio.setChecked(True)
+                self.remote_radio.setEnabled(False)
+                self.remote_connect_btn.setText("Connect")
+                self._show_remote_status(
+                    "Not connected: this receiver's certificate has CHANGED since last time (fingerprint now "
+                    f"{remote.short_fingerprint(event[1])}). Someone may be pretending to be that PC. "
+                    "If the receiver window shows this same fingerprint, it is safe to trust it.", "#ff7a93")
+                self._log("Remote: refused - the receiver's certificate fingerprint changed")
+                self.trust_btn.show()
             elif kind == "done":
                 info = event[1]
                 if info["ok"]:
@@ -2430,6 +2461,21 @@ class KinesisApp(QMainWindow):
         else:
             self._show_remote_status("Disconnected", "#9d8ec2")
             self._log("Remote: disconnected")
+
+    def trust_new_certificate(self):
+        """The user checked the new fingerprint against the receiver window: remember it and connect."""
+        try:
+            host, port = remote.parse_address(self.remote_ip_input.text())
+        except ValueError as e:
+            self._show_remote_status(str(e), "#ff7a93")
+            return
+        if self.untrusted_fingerprint:
+            self.settings.setdefault("remote_fingerprints", {})[f"{host}:{port}"] = self.untrusted_fingerprint
+            save_settings(self.settings)
+            self._log(f"Remote: now trusting fingerprint {remote.short_fingerprint(self.untrusted_fingerprint)}")
+        self.untrusted_fingerprint = None
+        self.trust_btn.hide()
+        self.toggle_remote_connection()
 
     def _show_remote_status(self, text, colour):
         self.remote_status_label.setText(text)
