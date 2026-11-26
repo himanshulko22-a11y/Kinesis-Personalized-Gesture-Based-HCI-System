@@ -11,6 +11,13 @@ Kinesis can control a **second PC** on the same Wi-Fi network or phone hotspot. 
 
 Everything between the two PCs is **encrypted with TLS** (1.2 or newer), including the pairing code.
 
+<p>
+  <img src="docs/images/remote_panel.png" alt="Remote Control panel in Kinesis, connected and encrypted with TLS" width="49%" />
+  <img src="docs/images/remote_receiver.png" alt="Kinesis Receiver window with the pairing code, fingerprint, allowed actions and log" width="49%" />
+</p>
+
+*Left: the Remote Control panel in Kinesis. Right: the receiver on the other PC. The IP addresses, pairing code and certificate fingerprint are blurred.*
+
 ## The two parts
 
 | Part | Runs on | What it does |

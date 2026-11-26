@@ -4,7 +4,20 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 
 ## Screenshots
 
-<img width="1920" height="1080" alt="screenshot_20261121_172704" src="https://github.com/user-attachments/assets/f4097a24-9e54-4164-a79a-ad57573208fd" />
+**Static pose:** the *peace* pose is recognised (mapped to Screenshot), with the speed readout on the video.
+
+<img src="docs/images/pose_peace.png" alt="Kinesis recognising the peace pose, with FPS and timing shown on the video" width="100%" />
+
+**Movement:** a *zigzag* made with an open hand, recognised with DTW. The trail shows the path the hand took.
+
+<img src="docs/images/movement_zigzag.png" alt="Kinesis recognising a zigzag movement, with its trail drawn on the video" width="100%" />
+
+**Remote control over Wi-Fi (encrypted with TLS):** the Kinesis panel (left) and the receiver on the other PC (right). The IP addresses, pairing code and certificate fingerprint are blurred.
+
+<p>
+  <img src="docs/images/remote_panel.png" alt="Remote Control panel in Kinesis, connected and encrypted with TLS" width="49%" />
+  <img src="docs/images/remote_receiver.png" alt="Kinesis Receiver window with the pairing code, fingerprint, allowed actions and log" width="49%" />
+</p>
 
 ## Features
 
@@ -26,7 +39,7 @@ Control your computer with hand gestures through your webcam. Kinesis lets you *
 - **Instant delete with undo:** deleting poses or movements (one at a time or several at once) is instant - deleted poses are ignored until you next retrain. Deleted gestures go to a trash file: **Undo** right after, or **Restore Deleted Gestures** later. The trash keeps them for 30 days (then they're removed automatically), or click **Empty Trash** to remove them now.
 - **Faster tracking option:** switch MediaPipe to its lite hand model for a higher frame rate.
 - **Collapsible panel:** every section of the side panel can be opened or closed (or all at once), and the app remembers your choice.
-- **Remote control over Wi-Fi:** control a second PC on the same Wi-Fi or phone hotspot. That PC runs the small `receiver.py` app (no camera or ML), which shows its IP address and a pairing code and only performs the actions its owner allows. Kinesis sends each action as a small JSON message and shows the round-trip time. See [REMOTE_CONTROL.md](REMOTE_CONTROL.md).
+- **Remote control over Wi-Fi:** control a second PC on the same Wi-Fi or phone hotspot. That PC runs the small `receiver.py` app (no camera or ML), which shows its IP address and a pairing code and only performs the actions its owner allows. Everything is **encrypted with TLS 1.2+**: the receiver makes its own certificate, and Kinesis checks its fingerprint, so nobody else on the Wi-Fi can read or fake the traffic. Kinesis sends each action as a small JSON message and shows the round-trip time. See [REMOTE_CONTROL.md](REMOTE_CONTROL.md).
 - **Safety options:** pause recognition at any time, reset all data, and save or restore a default setup. Gestures never fire while a dialog is open.
 
 ## Available actions
